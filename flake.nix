@@ -1,5 +1,5 @@
 {
-  description = "PHP 8.4 CLI as a single self-contained static binary (spike)";
+  description = "PHP 8.4 (php + php-cgi + phpdbg + php-fpm) as a single self-contained binary";
 
   nixConfig = {
     extra-substituters = [ "https://unpins.cachix.org" ];

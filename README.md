@@ -1,6 +1,6 @@
 # php
 
-[PHP 8.4](https://www.php.net/) — the popular general-purpose scripting language. A single self-contained binary (`php` + `php-cgi` + `phpdbg`, plus `php-fpm` on Linux/macOS), built natively for Linux, macOS, and Windows.
+[PHP](https://www.php.net/) — the general-purpose scripting language. A single self-contained binary, built natively for Linux, macOS, and Windows.
 
 [![CI](https://github.com/unpins/php/actions/workflows/php.yml/badge.svg)](https://github.com/unpins/php/actions)
 ![Linux](https://img.shields.io/badge/Linux-✓-success?logo=linux&logoColor=white)
@@ -56,41 +56,21 @@ The [Releases](https://github.com/unpins/php/releases) page has standalone binar
 
 ## Build notes
 
-- **Single multicall binary.** PHP's CLI-adjacent SAPIs — `php` (cli),
-  `php-cgi` (cgi/FastCGI), `phpdbg` (debugger), and `php-fpm` (FastCGI process
-  manager) — are each a separate `main()` built from the same source tree.
-  They are folded into one binary at `$out/bin/php`; `php-cgi`/`phpdbg`/
-  `php-fpm` are `argv[0]`-dispatch aliases. The bare/canonical `php` runs the
-  cli; the dispatcher matches on the program name (path- and `.exe`-stripped,
-  case-insensitive). `nm` confirms each SAPI defines only `main` (+ a couple of
-  cgi header symbols), so the shared PHP core is compiled once, just those
-  per-SAPI entry symbols are renamed, and the SAPIs link against the single
-  core. `php-fpm` is a POSIX daemon (fork/signals/setuid), so it is **not**
-  built on Windows.
-- **Curated extension set, all in-tree.** nixpkgs' `php` is a `buildEnv` that
-  loads extensions as out-of-tree `.so` files (via `phpize`) and wraps `bin/php`
-  with a store-path `PHP_INI_SCAN_DIR` — both incompatible with one relocatable
-  binary. We take the raw `./configure` build (`.unwrapped`), turn off the
-  module loader, and compile a "scripting essentials" extension set **in-tree**
-  atop `--disable-all`: bcmath, calendar, ctype, curl, dom, exif, fileinfo,
-  filter, ftp, gettext, gmp, iconv, mbstring, openssl, pcntl, pdo+pdo_sqlite,
-  phar, posix, session, simplexml, soap, sockets, sodium, sqlite3, tokenizer,
-  xml/xmlreader/xmlwriter, zip, zlib, bz2, and more.
-- **OPcache + JIT, statically linked in.** OPcache is normally a runtime
-  `zend_extension` `.so`; we vendor static-php-cli's `static_opcache_84.patch`
-  so it compiles in-tree, with JIT on. It's the #1 perf feature for the
-  long-running fpm/cgi SAPIs; for the cli it helps via `opcache.file_cache`.
-- **Zero store leaks.** A handful of compile-time data paths that would pin a
-  `/nix/store` ref (openssl `OPENSSLDIR`, libxml2's default catalog, gettext's
-  `LOCALEDIR`, the sendmail path, libpsl's suffix-list data file) are
-  neutralized or repointed to conventional system locations. TLS certs come from
-  `SSL_CERT_FILE` / the system trust store at runtime; `curl` is built with
-  Schannel on Windows and OpenSSL elsewhere.
-- **Static linking, per target.** Linux/macOS link static-musl / static against
-  curated static deps; Windows is a from-scratch mingw-win32 port (the win32
-  source compiled with mingw-gcc, no MSVC) producing a single self-contained
-  `php.exe` (`otool -L` / imports show only system libraries).
-- **No PEAR / phar wrapper.** PEAR is a package manager (a tree of `.php`
-  scripts + a runtime `phpize`/compiler), and the `phar` CLI tool hardcodes a
-  non-relocatable `#!` to the build's `bin/php` — neither ships. The Phar
-  *extension* is compiled in, so `Phar::` works from PHP code.
+- **One multicall binary.** `php` (the cli) is the canonical name; `php-cgi`
+  (cgi/FastCGI), `phpdbg` (the debugger), and `php-fpm` (the process manager)
+  are folded into the same binary and dispatch on `argv[0]`. Each SAPI is a
+  separate `main()` over the same core, so the core is linked once. `php-fpm` is
+  a POSIX daemon (fork/signals/setuid) and is **not** built on Windows.
+- **Extensions are compiled in, not loaded.** nixpkgs' `php` loads extensions as
+  out-of-tree `.so` files and bakes a store path into `bin/php` — neither works
+  in a single relocatable binary. Instead a curated set (bcmath, curl, dom, gmp,
+  iconv, mbstring, openssl, pdo_sqlite, soap, sodium, zip, … — run `php -m`) is
+  built statically into the binary, with OPcache + JIT on.
+- **TLS / certificates.** `curl` uses Schannel on Windows and OpenSSL elsewhere;
+  trust roots come from `SSL_CERT_FILE` / the system store at runtime, so no CA
+  bundle or `/nix/store` path is baked in.
+- **Windows** is a mingw build of PHP's own `win32` sources (no MSVC); the `.exe`
+  is self-contained, importing only system DLLs.
+- **No PEAR or `phar` wrapper.** PEAR is a runtime package manager and the `phar`
+  tool hardcodes a non-relocatable path to `bin/php`; both are dropped. The Phar
+  *extension* is compiled in, so `Phar::` still works from PHP.
