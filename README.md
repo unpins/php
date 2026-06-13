@@ -65,7 +65,9 @@ The [Releases](https://github.com/unpins/php/releases) page has standalone binar
   out-of-tree `.so` files and bakes a store path into `bin/php` — neither works
   in a single relocatable binary. Instead a curated set (bcmath, curl, dom, gmp,
   iconv, mbstring, openssl, pdo_sqlite, soap, sodium, zip, … — run `php -m`) is
-  built statically into the binary, with OPcache + JIT on.
+  built statically into the binary, with OPcache + JIT on. Extensions needing a
+  large external runtime (intl/ICU, gd) or a database server (pgsql, mysqli) are
+  left out.
 - **TLS / certificates.** `curl` uses Schannel on Windows and OpenSSL elsewhere;
   trust roots come from `SSL_CERT_FILE` / the system store at runtime, so no CA
   bundle or `/nix/store` path is baked in.
