@@ -29,6 +29,35 @@
     let
       ulib = unpins-lib.lib;
 
+      # PHP is C; build it under the unpin-llvm engine (clang/lld, static musl,
+      # single multicall binary). Its deps stay ordinary pkgsStatic `.a`s (built
+      # by the set-wide engine swap) linked as external native archives.
+      #
+      # LTO is OFF. PHP ships opcache's JIT — a runtime machine-code generator.
+      # clang-21's whole-program LTO has a codegen-miscompile class (sox prints
+      # "SoX v(null)"; the darwin ffmpeg teardown SIGSEGV — llvm/llvm-project
+      # #186922 / ziglang/zig#20198) that bites silently. A miscompiled JIT
+      # generator would corrupt emitted code only on hot paths, invisible to a
+      # trivial smoke. LTO is an optimization, not required for the single-binary
+      # fold, so drop it for the whole package; revisit only behind a
+      # JIT-exercising correctness gate.
+      # cxx = false: PHP is pure C. The libunwind dependency (see the -lc++ link
+      # trigger in mkPhp's preConfigure) is pulled at LINK time via the driver's
+      # wantsCxx detection, not this stdenv flag — the engine's link driver reads
+      # `cxx` from the link ARGS (clang++/`-lc++`/`.cpp` inputs), so this param
+      # only governs whether a C++ compiler is wired for compilation, which PHP
+      # doesn't use.
+      engStdenv = pkgs:
+        let sp = pkgs.pkgsStatic; in
+        ulib.unpinAdapterStdenv {
+          inherit pkgs;
+          target = sp.stdenv.hostPlatform.config;
+          native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+          cxx = false;
+          lto = false;
+          captureLinks = true;
+        };
+
       mkPhp = pkgs:
         let
           s = pkgs.pkgsStatic;
@@ -109,12 +138,12 @@
             "--with-curl=${curlNoPsl.dev}"
             "--with-zlib"
             "--with-iconv"
-            "--with-gmp=${s.gmp.dev}"
+            "--with-gmp=${gmp.dev}"
             "--with-gettext=${s.gettext}"
             "--with-sodium"
             "--with-bz2=${s.bzip2.dev}"
-            "--with-sqlite3=${s.sqlite.dev}"
-            "--with-pdo-sqlite=${s.sqlite.dev}"
+            "--with-sqlite3=${sqlite.dev}"
+            "--with-pdo-sqlite=${sqlite.dev}"
             "--with-readline=${readlineFB.dev}"
             "--with-zip"
             # generic.nix bakes PROG_SENDMAIL=${system-sendmail}/bin/sendmail (a
@@ -136,15 +165,56 @@
           # checks; dropping it removes the leak with negligible functional loss.
           curlNoPsl = s.curl.override { pslSupport = false; };
 
+          # Darwin-engine CC_FOR_BUILD fix. Several autotools/autosetup deps run a
+          # build-host codegen bootstrap that probes CC_FOR_BUILD (gmp's gen tool;
+          # sqlite's autosetup jimsh0 via autosetup-find-tclsh). pkgsStatic
+          # (host≠build) leaves CC_FOR_BUILD at the vanilla darwin cc wrapper, but
+          # under the engine that wrapper drives the ELF `ld.lld` and can't emit a
+          # runnable Mach-O host tool → the probe fails (gmp: "Specified
+          # CC_FOR_BUILD doesn't seem to work"; sqlite: silent — jimsh0 build is
+          # `2>/dev/null >/dev/null`, then "No working C compiler", exit 1). Pin
+          # CC_FOR_BUILD to $CC: on a native darwin build (every shipped darwin
+          # target is build==host) the engine cc IS the build-host compiler and
+          # links via ld64.lld. darwin-only → linux deps stay byte-identical. (The
+          # local aarch64 cross-helper can't run these gen tools regardless — CI
+          # macos-14 native is the source of truth for aarch64-darwin.)
+          withDarwinBuildCC = drv:
+            if s.stdenv.hostPlatform.isDarwin
+            then drv.overrideAttrs (o: {
+              preConfigure = (o.preConfigure or "") + ''
+                export CC_FOR_BUILD=$CC
+              '';
+            })
+            else drv;
+
+          gmp = withDarwinBuildCC (s.gmp.overrideAttrs (o:
+            lib.optionalAttrs s.stdenv.hostPlatform.isDarwin {
+              # gmp's hand-written x86_64 mpn assembly (x86_64_add_n.o/sub_n.o)
+              # emits a rel8 BRANCH the Mach-O ld64.lld rejects at the static-lib
+              # link ("BRANCH relocation has width 1 bytes, but must be 4"). Linux
+              # ELF lld relaxes it, so this is darwin-only; drop to gmp's generic
+              # C mpn (same as gmp on arches without an asm path — functionally
+              # identical, marginally slower bignum, nothing disabled). Linux keeps
+              # the assembly, byte-identical. --disable-fat too: nixpkgs sets
+              # --enable-fat (runtime per-CPU asm dispatch), which configure
+              # refuses to combine with --disable-assembly ("when doing a fat
+              # build, disabling assembly will not work"); dropping fat leaves the
+              # plain generic-C build.
+              configureFlags = (o.configureFlags or [ ])
+                ++ [ "--disable-fat" "--disable-assembly" ];
+            }));
+
+          sqlite = withDarwinBuildCC s.sqlite;
+
           extInputs = [
             curlNoPsl
             s.openssl
             s.zlib
             s.libxml2
-            s.sqlite
+            sqlite
             s.oniguruma
             readlineFB
-            s.gmp
+            gmp
             s.gettext
             s.libsodium
             s.bzip2
@@ -159,7 +229,7 @@
           # filtering configureFlags by string) also drops their deps: no acl
           # (fpm), no pear install step.
           php = pkgs.php84.override {
-            stdenv = s.stdenv;
+            stdenv = engStdenv pkgs;
             pcre2 = s.pcre2;
             # Use the psl-disabled curl as php84's named `curl` dep too, not just
             # via the --with-curl flag below. generic.nix adds this attr as a
@@ -315,7 +385,18 @@
           # generated Makefile's $(LDFLAGS), so unpin-multicall.mk picks them up too.
           # macOS resolves -framework and archives regardless of link position.
           + lib.optionalString s.stdenv.hostPlatform.isDarwin ''
-            export LDFLAGS="-framework CoreFoundation -framework CoreServices -framework SystemConfiguration -L${iconvCompat}/lib -liconvcompat -L${lib.getLib s.libiconvReal}/lib -liconv ''${LDFLAGS:-}"
+            # libresolv: php's ext/standard/dns.c (dns_get_record/checkdnsrr/
+            # getmxrr) needs the macOS resolver — dns_search + the res_9_*/dn_expand
+            # family. These live ONLY in libresolv, not libSystem. The pre-engine
+            # (full-SDK) build linked nixpkgs' STATIC `libresolv.a` (its `-lresolv`
+            # conftest resolved to the static archive), so the symbols were embedded
+            # and the binary carried NO libresolv load command — which is what keeps
+            # it inside the darwin portability allow-list (libSystem/frameworks/
+            # libobjc only; libresolv.9.dylib would be rejected). Link the same
+            # static archive here. (An earlier engine attempt linked the host SDK's
+            # libresolv.tbd — a DYLIB stub — which added a `/usr/lib/libresolv.9.dylib`
+            # load command the allow-list rejects; the static .a is the fix.)
+            export LDFLAGS="-framework CoreFoundation -framework CoreServices -framework SystemConfiguration -L${s.darwin.libresolv}/lib -lresolv -L${iconvCompat}/lib -liconvcompat -L${lib.getLib s.libiconvReal}/lib -liconv ''${LDFLAGS:-}"
             # ext/iconv.c, when it detects GNU libiconv (HAVE_LIBICONV, via the
             # _libiconv_version probe), `#undef`s any iconv->libiconv rename and
             # then calls the *plain* iconv() — which needs the included <iconv.h>
@@ -331,6 +412,42 @@
             # the plain header leaves it iconv -> _iconv via the iconvCompat shim).
             # Cosmetic only: phpinfo reports the iconv impl as "unknown".
             export php_cv_iconv_implementation=unknown
+            # ext/standard/dns.c needs <resolv.h> + <arpa/nameser.h> for PHP's
+            # real DNS resolver (dns_get_record / checkdnsrr / getmxrr / dns_get_mx).
+            # The nixpkgs apple-sdk that the engine pins as SDKROOT is a trimmed
+            # subset that omits exactly those two headers (verified: absent from
+            # apple-sdk-14.4, and nixpkgs ships them nowhere for darwin) — so the
+            # SDK-always base needs supplementing here. Both build hosts (the local
+            # Mac builder and GHA macos-14) carry a full macOS SDK, and the resolver
+            # headers are decades-stable, so fill the gap from the host SDK. Use
+            # -idirafter (LOWEST search priority) so the pinned apple-sdk stays
+            # authoritative for every header it does ship; the host SDK is consulted
+            # only for the two it lacks. darwin-only. (Same trimmed-SDK gap tmux
+            # sidesteps by stripping the include — php can't, it uses the resolver.)
+            # Injected via CPPFLAGS (php bakes it into the Makefile's compile line,
+            # the same channel the darwin LDFLAGS above uses) — the engine darwin
+            # cc-wrapper does not honor NIX_CFLAGS_COMPILE. `env -u` strips the
+            # build's DEVELOPER_DIR / SDKROOT (both point at the pinned nixpkgs SDK),
+            # so `xcrun --show-sdk-path` resolves the HOST's full SDK via xcode-select
+            # instead of the trimmed one — portable across the CLT layout on the
+            # local Mac builder and the Xcode layout on GHA macos-14.
+            export CPPFLAGS="-idirafter $(/usr/bin/env -u DEVELOPER_DIR -u SDKROOT /usr/bin/xcrun --show-sdk-path)/usr/include ''${CPPFLAGS:-}"
+          ''
+          # Engine (Linux/musl): opcache JIT's zend_jit_unwind_cb and
+          # Zend/zend_call_stack.c (HAVE_UNWIND, JIT/fiber stack-bounds probing)
+          # call _Unwind_Backtrace + _Unwind_GetCFA. gcc/musl pulled these from
+          # libgcc; the engine (compiler-rt, no libgcc) provides the _Unwind_*
+          # API only in libunwind, and its link driver adds -lunwind ONLY when it
+          # detects a C++ link (unpin_musl.cpp wantsCxx: argv0 "++", -lc++,
+          # .cpp inputs). A bare `-lc++` on the link line flips that detection,
+          # so the driver emits its `--start-group -lc++ -lc++abi -lunwind …`
+          # group. The libc++/libc++abi archives stay inert (no C++ symbol is
+          # referenced by this C binary — archive semantics link only libunwind's
+          # _Unwind_* objects), so the fold gains exactly the unwinder gcc used to
+          # supply, nothing more. LDFLAGS is baked into the Makefile's $(LDFLAGS),
+          # so the four sapi links AND unpin-multicall.mk's relink all pick it up.
+          + lib.optionalString s.stdenv.hostPlatform.isLinux ''
+            export LDFLAGS="-lc++ ''${LDFLAGS:-}"
           ''
           + ''
             # JIT's host codegen tools (minilua, gen_ir_fold_hash) compile and run
@@ -365,11 +482,46 @@
               -t ${lib.getOutput "out" s.gettext} \
               "$out/bin/php"
           '';
+        }
+        # darwin: the engine's ld64.lld advertises "compatible with GNU linkers",
+        # so php's configure-generated `libtool` (its C/default tag) misdetects GNU
+        # ld and bakes ELF-spelled linker flag-specs — `--export-dynamic` and a
+        # per-libdir `--rpath` — which ld64.lld rejects (`unknown argument
+        # '--export-dynamic'` / `'--rpath', did you mean '-rpath'`), breaking every
+        # sapi link. The SAME libtool's C++ (CXX) tag detected darwin correctly and
+        # left these specs empty — the native-darwin value. Reset the C-tag specs to
+        # match: empty is what a real macOS libtool emits (Mach-O needs neither — a
+        # fully-static all-in binary dlopen's no extension, and hardcoded runpaths
+        # into /nix/store are meaningless). Also blank whole_archive_flag_spec (GNU
+        # `--whole-archive`) so a convenience-archive link — e.g. the unpin-multicall
+        # relink — can't reintroduce the gap. archive_cmds' `-soname` differs too but
+        # only fires when building a *shared* lib, which this static build never does.
+        # optionalAttrs (not a gated string) so the key is ABSENT on Linux — adding
+        # even an empty `postConfigure=""` would perturb the Linux derivation hash.
+        // lib.optionalAttrs s.stdenv.hostPlatform.isDarwin {
+          postConfigure = (old.postConfigure or "") + ''
+            substituteInPlace libtool \
+              --replace-fail 'export_dynamic_flag_spec="\''${wl}--export-dynamic"' 'export_dynamic_flag_spec=""' \
+              --replace-fail 'hardcode_libdir_flag_spec="\''${wl}--rpath \''${wl}\$libdir"' 'hardcode_libdir_flag_spec=""' \
+              --replace-fail 'whole_archive_flag_spec="\''${wl}--whole-archive\$convenience \''${wl}--no-whole-archive"' 'whole_archive_flag_spec=""'
+          '';
         });
     in
     ulib.mkStandaloneFlake {
       inherit self;
       name = "php";
+      # unpin-llvm engine. All targets green: Linux (x86_64/i686/ppc64le/riscv64/
+      # aarch64/armv7l) + Windows + darwin. The set-wide engine swap surfaced a
+      # tail of darwin-engine gaps, all resolved darwin-gated (linux byte-
+      # identical): gmp CC_FOR_BUILD + --disable-fat/assembly; sqlite autosetup
+      # CC_FOR_BUILD; the trimmed apple-sdk's missing resolver headers (-idirafter
+      # host SDK); the libtool GNU-ld misdetection that baked ELF `--export-dynamic`/
+      # `--rpath` into the sapi links (postConfigure resets the C-tag flag-specs to
+      # their native-darwin empty values — see below); and the resolver link — use
+      # nixpkgs' STATIC libresolv.a (symbols embedded, no dylib load command) so the
+      # binary stays inside the darwin portability allow-list, matching how the
+      # pre-engine full-SDK build linked it (see the darwin LDFLAGS above).
+      engine = "unpin-llvm";
       embedMan = false;
       smoke = [ "-r" "echo 'php ' . (6 * 7);" ];
       smokePattern = "php 42";
