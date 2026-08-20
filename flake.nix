@@ -269,7 +269,16 @@
         # `.unwrapped` is the raw ./configure derivation (bin/php only). Layer the
         # curated extension set on top of its `--disable-all` base.
         php.unwrapped.overrideAttrs (old: {
-          configureFlags = (old.configureFlags or [ ]) ++ extConfigure;
+          # `--with-config-file-path` defaults to `$prefix/lib`, so `php -i`
+          # reported the php.ini path as a /nix/store directory that does not
+          # exist on a user's machine -- every php.ini (timezone, memory_limit,
+          # error_reporting) was silently ignored. /etc is where PHP looks on
+          # every distro; the scan dir follows the same convention. Same class as
+          # e2fsprogs' mke2fs.conf and mtools' --sysconfdir.
+          configureFlags = (old.configureFlags or [ ]) ++ extConfigure ++ [
+            "--with-config-file-path=/etc"
+            "--with-config-file-scan-dir=/etc/php.d"
+          ];
           buildInputs = (old.buildInputs or [ ]) ++ extInputs;
 
           # PHP's fopencookie seeker test can't run under cross (pkgsStatic =
@@ -522,7 +531,10 @@
       # binary stays inside the darwin portability allow-list, matching how the
       # pre-engine full-SDK build linked it (see the darwin LDFLAGS above).
       engine = "unpin-llvm";
-      embedMan = false;
+      # php.1, php-cgi.1, phpdbg.1, phar.1 and phar.phar.1 -- the base installs
+      # all five, and this is a cli+cgi+phpdbg multicall whose flags are worth a
+      # man page. The opt-out here was never explained and never revisited since
+      # the package's first commit.
       smoke = [ "-r" "echo 'php ' . (6 * 7);" ];
       smokePattern = "php 42";
       build = pkgs: mkPhp pkgs;

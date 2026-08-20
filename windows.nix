@@ -18,7 +18,18 @@
 { pkgs, ulib }:
 let
   lib = pkgs.lib;
-  S = ulib.mingwStaticCross pkgs;
+  # OPENSSLDIR/ENGINESDIR/MODULESDIR default to openssl's own $out, so the .exe
+  # carried live references to `openssl-…-w64-mingw32` and its `-etc` -- two
+  # store paths that exist on no user's machine. This is closure hygiene, not a
+  # TLS fix: that OPENSSLDIR is an empty directory even inside the store, and
+  # PHP resolves CAs through openssl.cafile / SSL_CERT_FILE / the system store,
+  # so nothing resolved differently before. The retarget is set-wide ONLY in the
+  # engine's native scope (nix-lib/native-overlay/openssl.nix); the mingw scope
+  # has none -- openssl/flake.nix:57 retargets the openssl PACKAGE's own .exe,
+  # not the scope. C:/ssl is the value that package uses.
+  S = (ulib.mingwStaticCross pkgs).extend (final: prev: {
+    openssl = prev.openssl.overrideAttrs (ulib.retargetOpenssl "C:/ssl");
+  });
   stdenv = S.stdenv;
   binutils = pkgs.pkgsCross.mingwW64.buildPackages.binutils;
 
