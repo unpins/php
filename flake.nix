@@ -492,27 +492,29 @@
               "$out/bin/php"
           '';
         }
-        # darwin: the engine's ld64.lld advertises "compatible with GNU linkers",
-        # so php's configure-generated `libtool` (its C/default tag) misdetects GNU
-        # ld and bakes ELF-spelled linker flag-specs — `--export-dynamic` and a
-        # per-libdir `--rpath` — which ld64.lld rejects (`unknown argument
-        # '--export-dynamic'` / `'--rpath', did you mean '-rpath'`), breaking every
-        # sapi link. The SAME libtool's C++ (CXX) tag detected darwin correctly and
-        # left these specs empty — the native-darwin value. Reset the C-tag specs to
-        # match: empty is what a real macOS libtool emits (Mach-O needs neither — a
-        # fully-static all-in binary dlopen's no extension, and hardcoded runpaths
-        # into /nix/store are meaningless). Also blank whole_archive_flag_spec (GNU
-        # `--whole-archive`) so a convenience-archive link — e.g. the unpin-multicall
-        # relink — can't reintroduce the gap. archive_cmds' `-soname` differs too but
-        # only fires when building a *shared* lib, which this static build never does.
+        # darwin: php's configure-generated `libtool` used to misdetect GNU ld —
+        # the engine's ld64.lld advertises "compatible with GNU linkers" — and bake
+        # ELF-spelled flag-specs (`--export-dynamic`, a per-libdir `--rpath`,
+        # `--whole-archive`) that ld64.lld rejects, breaking every sapi link. It
+        # detects darwin correctly since nix-lib 4302d17 wrapped ld64.lld in the
+        # `-r` guard: `checking if the linker is GNU ld` went yes -> no, and the
+        # three specs now arrive at their native-darwin values on their own. The
+        # substitutions that forced them are therefore gone.
+        #
+        # What stays is the alarm. The misdetection is one linker banner away from
+        # returning, and it does not fail here — it fails much later, at the sapi
+        # link, as `unknown argument '--export-dynamic'`. So assert the OUTCOME
+        # rather than patch the input: a spec spelled the GNU way is a hard error
+        # at configure time. Checking the result also survives a respelling, which
+        # the old `--replace-fail` patterns could not.
         # optionalAttrs (not a gated string) so the key is ABSENT on Linux — adding
         # even an empty `postConfigure=""` would perturb the Linux derivation hash.
         // lib.optionalAttrs s.stdenv.hostPlatform.isDarwin {
           postConfigure = (old.postConfigure or "") + ''
-            substituteInPlace libtool \
-              --replace-fail 'export_dynamic_flag_spec="\''${wl}--export-dynamic"' 'export_dynamic_flag_spec=""' \
-              --replace-fail 'hardcode_libdir_flag_spec="\''${wl}--rpath \''${wl}\$libdir"' 'hardcode_libdir_flag_spec=""' \
-              --replace-fail 'whole_archive_flag_spec="\''${wl}--whole-archive\$convenience \''${wl}--no-whole-archive"' 'whole_archive_flag_spec=""'
+            if grep -nE '^(export_dynamic_flag_spec|hardcode_libdir_flag_spec|whole_archive_flag_spec)=.*(--export-dynamic|--rpath|--whole-archive)' libtool; then
+              echo "libtool baked GNU linker specs on darwin: ld64.lld will reject them at the sapi link. See the comment above this check in flake.nix." >&2
+              exit 1
+            fi
           '';
         });
     in
