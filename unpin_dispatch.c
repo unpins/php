@@ -9,6 +9,7 @@
  * a leading --unpin-program=NAME flag (bare-binary dispatch) or the argv[0]
  * basename (alias dispatch); the default applet is the cli. */
 
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -59,7 +60,15 @@ int main(int argc, char **argv)
 		r = run(name, argc - 1, argv + 1);
 		if (r != -1)
 			return r;
-		/* unknown program name: fall through to argv[0]/default. */
+		/* Unknown name: refuse. Falling through would leave NAME sitting
+		 * where the cli expects a script path, so `--unpin-program=typo`
+		 * would RUN a file called `typo` from the working directory --
+		 * the opposite of a refusal, and invisible to a caller who only
+		 * checks the exit code. */
+		fputs("php: no program '", stderr);
+		fputs(name, stderr);
+		fputs("'\n", stderr);
+		return 1;
 	}
 
 	/* 2. dispatch on the invoked name (symlink/alias). */

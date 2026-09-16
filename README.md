@@ -68,6 +68,15 @@ The [Releases](https://github.com/unpins/php/releases) page has standalone binar
   built statically into the binary, with OPcache + JIT on. Extensions needing a
   large external runtime (intl/ICU, gd) or a database server (pgsql, mysqli) are
   left out.
+- **Tests.** PHP's own suite runs on every build that can execute what it just
+  produced, restricted to the engine and the language tests: 5600 tests, all
+  green under static musl. The extension suites are not run. Nine of their
+  ~17 000 tests do fail here, and they say what you would expect a static musl
+  build to say: musl's `iconv` converts a smaller set of encodings than glibc's,
+  `posix_pathconf` is not implemented, and `php -v` prints an extra line for the
+  built-in OPcache. (Another handful fail for the machine rather than the build
+  — no system locales, no FTPS server — and fail the same way for a distro php.)
+  Pinning that list of names would go stale at the next PHP release.
 - **TLS / certificates.** `curl` uses Schannel on Windows and OpenSSL elsewhere;
   trust roots come from `SSL_CERT_FILE` / the system store at runtime, so no CA
   bundle or `/nix/store` path is baked in.

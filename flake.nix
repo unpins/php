@@ -324,6 +324,27 @@
           postPatch = (old.postPatch or "") + ''
             substituteInPlace ext/opcache/config.m4 \
               --replace-fail '[aarch64*], [' '[aarch64*|arm64*], ['
+
+            # `php -a` answers "requires the readline extension" even though
+            # readline IS linked in and `php -m` lists it: the extension reaches
+            # the cli's callback table with dlsym(RTLD_DEFAULT, …), and in a
+            # static binary that lookup returns NULL, so the shell is never
+            # registered. Upstream's own commented-out alternative right below
+            # the dlsym is the direct call, but taking it plainly breaks the
+            # three standalone sapi links that happen before the multicall
+            # relink — php_cli_get_shell_callbacks lives in the cli, and a weak
+            # *reference* is an ELF idea that ld64 rejects outright. A weak
+            # *definition* works on both formats: the cli's real function
+            # overrides it wherever the cli is linked (the cli itself and the
+            # multicall), and where it is not — cgi, fpm and phpdbg, none of
+            # which has an interactive shell — the callbacks come back NULL,
+            # exactly what the dlsym used to return there.
+            substituteInPlace ext/readline/readline_cli.c \
+              --replace-fail '#include "readline_cli.h"' \
+                '#include "readline_cli.h"
+__attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) { return (cli_shell_callbacks_t *)0; }' \
+              --replace-fail 'get_callbacks = dlsym(RTLD_DEFAULT, "php_cli_get_shell_callbacks");' \
+                             'get_callbacks = php_cli_get_shell_callbacks;'
           '';
 
           # Static link needs every transitive dep on the line in order — but
@@ -368,10 +389,27 @@
             # compiled in (--enable-phar), so `Phar::` works from PHP code. Drop the
             # non-relocatable command-line wrapper from the shipped binary.
             rm -f "$out/bin/phar" "$out/bin/phar.phar"
+            # And their manuals with them. The man pages are embedded wholesale
+            # from this output, so leaving these two behind ships `unpin man php
+            # phar` — a manual for a command the binary does not have.
+            rm -f "$out/share/man/man1/phar.1"* "$out/share/man/man1/phar.phar.1"*
           '';
 
           preConfigure = (old.preConfigure or "") + ''
             export PKG_CONFIG="''${PKG_CONFIG:-pkg-config} --static"
+
+            # PHP guards against blowing the C stack (deep recursion, nested
+            # object comparison) and raises "Maximum call stack size reached"
+            # instead of dying. The whole feature hangs on one configure probe
+            # that RUNS a program to see which way the stack grows — and under
+            # pkgsStatic build != host, so autoconf cannot run it and takes the
+            # cross branch, which answers "no". The guard was compiled out of
+            # every binary we ship: measured, `zend.max_allowed_stack_size` did
+            # not even exist as a setting, and on a normal 8 MB stack deep
+            # recursion SEGFAULTED where nixpkgs' php raises the error. The
+            # stack grows downwards on every platform in this catalog, so
+            # answer the probe.
+            export php_cv_have_stack_limit=yes
           ''
           # darwin static link needs two things PHP's own configure won't supply:
           #
@@ -484,6 +522,24 @@
             ++ [ pkgs.removeReferencesTo ];
           # Only the real multicall binary needs scrubbing; the sapi names are
           # symlinks to it.
+          # PHP's own suite, restricted to the engine and the language tests:
+          # 5600 tests in 11 seconds, all green under static musl and the
+          # engine — and the first thing a codegen miscompile would take down.
+          # The extension suites stay out: 24 of their tests fail for reasons
+          # that are musl's or this build's rather than defects (gettext and
+          # iconv answer differently under musl, pathconf is unimplemented, two
+          # want an FTPS server, one wants a fork-safe pcre), and pinning 24
+          # test names would go stale at the next PHP release. run-tests.php
+          # exits non-zero on failure, so this needs no output matching; by
+          # checkPhase time sapi/cli/php is already the multicall binary.
+          doCheck = pkgs.pkgsStatic.stdenv.buildPlatform.canExecute
+            pkgs.pkgsStatic.stdenv.hostPlatform;
+          checkPhase = ''
+            runHook preCheck
+            TEST_PHP_EXECUTABLE="$PWD/sapi/cli/php" NO_INTERACTION=1 SKIP_PERF_SENSITIVE=1 \
+              "$PWD/sapi/cli/php" run-tests.php -q -j"''${NIX_BUILD_CORES:-4}" Zend tests
+            runHook postCheck
+          '';
           postFixup = (old.postFixup or "") + ''
             remove-references-to \
               -t ${lib.getOutput "etc" s.openssl} \
@@ -533,10 +589,21 @@
       # binary stays inside the darwin portability allow-list, matching how the
       # pre-engine full-SDK build linked it (see the darwin LDFLAGS above).
       engine = "unpin-llvm";
-      # php.1, php-cgi.1, phpdbg.1, phar.1 and phar.phar.1 -- the base installs
-      # all five, and this is a cli+cgi+phpdbg multicall whose flags are worth a
-      # man page. The opt-out here was never explained and never revisited since
-      # the package's first commit.
+      # Four manuals ride along, one per program the binary answers to: php.1,
+      # php-cgi.1, phpdbg.1 and php-fpm.8. The base installs two more, for the
+      # `phar` tool that postInstall deletes; they go with it.
+      # PHP bakes its install prefix into the binary nine times over — bindir,
+      # libdir, sysconfdir, extension_dir and the rest — and Nix reads them as a
+      # runtime reference to the build output, so `nix build` fetched that whole
+      # 35 MB tree (php-fpm, php-cgi, phpdbg, configs, manuals) to hand over a
+      # 33 MB binary that reaches none of it: the extension directory does not
+      # even exist, and the ini path is already /etc. The `.exe` had two of its
+      # own — gettext's locale root and curl's public-suffix list, both paths
+      # that exist on no Windows machine — dragging a 113 MB closure behind a
+      # 26 MB binary. (postFixup scrubs the same two on the native side, where
+      # it can name the store paths directly; this is the only lever the
+      # windowsBuild path has.)
+      removeReferences = [ "php-static" "php-windows" "gettext" "publicsuffix" ];
       smoke = [ "-r" "echo 'php ' . (6 * 7);" ];
       smokePattern = "php 42";
       build = pkgs: mkPhp pkgs;

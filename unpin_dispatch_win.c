@@ -12,6 +12,7 @@
  * trailing ".exe" (case-insensitively), and matching is case-insensitive —
  * all to suit Windows path/exe-name conventions. No <unistd.h>. */
 
+#include <stdio.h>
 #include <string.h>
 
 extern int unpin_cli_main(int, char **);
@@ -69,7 +70,12 @@ int main(int argc, char **argv)
 		r = run(name, argc - 1, argv + 1);
 		if (r != -1)
 			return r;
-		/* unknown program name: fall through to argv[0]/default. */
+		/* Unknown name: refuse -- see the POSIX dispatcher for why
+		 * falling through is worse than an error. */
+		fputs("php: no program '", stderr);
+		fputs(name, stderr);
+		fputs("'\n", stderr);
+		return 1;
 	}
 
 	/* 2. dispatch on the invoked name (alias / .exe copy). */
