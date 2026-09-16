@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Known issues
+
+- On the 32-bit x86 build only, a `WeakMap` that stores itself crashes the
+  process when printed (`$map[$map] = $map; var_dump($map);`). It is not new —
+  the same three lines crash the i686 binaries we have published — and it is not
+  a stack overflow: it happens at any stack size. Every other platform, 32-bit
+  ARM included, prints the expected output.
+
 ### Fixed
 
 - Deep recursion raises PHP's own error instead of crashing the process. On the
