@@ -2,16 +2,15 @@
 
 ## [Unreleased]
 
-### Known issues
-
-- On the 32-bit x86 build only, a `WeakMap` that stores itself crashes the
-  process when printed (`$map[$map] = $map; var_dump($map);`). It is not new —
-  the same three lines crash the i686 binaries we have published — and it is not
-  a stack overflow: it happens at any stack size. Every other platform, 32-bit
-  ARM included, prints the expected output.
-
 ### Fixed
 
+- Weak references no longer crash the 32-bit x86 build. Storing an object in a
+  `WeakMap` under a key that is itself a `WeakMap`, a `WeakReference` or an
+  `SplObjectStorage` killed the process as soon as the map was printed or
+  iterated — `$map[$other] = 1; var_dump($map);` was enough, and so was the
+  self-storing map (`$map[$map] = $map;`) reported earlier as a known issue.
+  Only the i686 build was affected; every other platform, 32-bit ARM included,
+  was always correct.
 - Deep recursion raises PHP's own error instead of crashing the process. On the
   8 MB stack Linux gives a process by default, comparing deeply nested objects
   (or any deep recursion) segfaulted; PHP's stack guard — the one that answers

@@ -298,6 +298,34 @@
           # running the test; this only supplies the answer the cross host can't.
           php_cv_shm_mmap_anon = "yes";
 
+          # ZEND_CHECK_ALIGNMENT is another AC_RUN test, and its cross fallback is
+          # a hardcoded `(size_t)8 (size_t)3 0` — right for every 64-bit target and
+          # for armv7l (ARM EABI aligns `double` to 8), wrong for i686, where the
+          # i386 SysV ABI aligns `double` to 4, so __alignof__ of Zend's probe union
+          # {void*, double, long} is 4 and LOG2 is 2. Measured with clang -target
+          # across all nine shipped targets: i686 is the only 4; x86_64, i686's
+          # 32-bit sibling armv7l, aarch64, riscv64, ppc64le, the mingw x86_64 and
+          # both darwins are all 8.
+          #
+          # This is not a tuning knob. zend_weakrefs keys the weak-reference
+          # registry by `(uintptr_t)object >> ZEND_MM_ALIGNMENT_LOG2` and rebuilds
+          # the pointer with `key << ZEND_MM_ALIGNMENT_LOG2`, so a LOG2 one too
+          # large silently drops bit 2 of every object address. Objects that happen
+          # to land 8-aligned survive; the ones at 4 (mod 8) come back as a pointer
+          # 4 bytes off and the first dereference segfaults. That is the i686
+          # WeakMap crash: `$a[$b] = 1; var_dump($a)` with `$b` a WeakMap,
+          # WeakReference or SplObjectStorage (the classes the registry tracks)
+          # dies, while a plain stdClass key survives. Control: the same PHP 8.4.21
+          # built natively for i686 (where the AC_RUN test does run) prints fine
+          # under both gcc and clang 21.
+          # Set for every target, not just i686: an empty value would look "cached"
+          # to AC_CACHE_CHECK and define ZEND_MM_ALIGNMENT to nothing, so the
+          # non-i686 branch has to carry the real answer rather than be omitted.
+          php_cv_align_mm =
+            if s.stdenv.hostPlatform.isx86_32
+            then "(size_t)4 (size_t)2 0"
+            else "(size_t)8 (size_t)3 0";
+
           # Static opcache+JIT. opcache is a zend_extension, not a regular module:
           # flipping config.m4's `ext_shared=yes` alone makes genif emit a bogus
           # `phpext_opcache_ptr` reference (build error). Upstream PHP 8.4 still
@@ -534,20 +562,13 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
           # checkPhase time sapi/cli/php is already the multicall binary.
           doCheck = pkgs.pkgsStatic.stdenv.buildPlatform.canExecute
             pkgs.pkgsStatic.stdenv.hostPlatform;
+          # weakmap_weakness.phpt used to be deleted here on i686, where it
+          # segfaulted. It was right and we were wrong: the crash was the
+          # hardcoded ZEND_MM_ALIGNMENT cross fallback (see php_cv_align_mm
+          # above), not a codegen defect. The test runs on every target now, and
+          # it is the gate that keeps that fallback honest.
           checkPhase = ''
             runHook preCheck
-          '' + pkgs.lib.optionalString pkgs.pkgsStatic.stdenv.hostPlatform.isx86_32 ''
-            # i686: one test is a known crash, and it is NOT this change's doing
-            # — the CI artifact of the commit before it (420bd87) segfaults on
-            # the same three lines. A WeakMap that holds itself
-            # (`$map[$map] = $map; var_dump($map);`) dies in var_dump at any
-            # stack size, with the stack guard on or off, and the armv7l
-            # artifact of this very commit prints it fine, so it is 32-bit x86
-            # codegen rather than recursion or word size. Recorded as open;
-            # skipping it keeps the other 5629 tests guarding the build instead
-            # of leaving the whole gate red for a defect it only found.
-            rm -f Zend/tests/weakrefs/weakmap_weakness.phpt
-          '' + ''
             TEST_PHP_EXECUTABLE="$PWD/sapi/cli/php" NO_INTERACTION=1 SKIP_PERF_SENSITIVE=1 \
               "$PWD/sapi/cli/php" run-tests.php -q -j"''${NIX_BUILD_CORES:-4}" Zend tests
             runHook postCheck
