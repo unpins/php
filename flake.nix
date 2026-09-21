@@ -526,11 +526,25 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
           ''
           + ''
             # JIT's host codegen tools (minilua, gen_ir_fold_hash) compile and run
-            # on the BUILD host. Under pkgsStatic (a cross from the glibc build
-            # host) configure's BUILD_CC probe finds no bare `cc`/`gcc` in PATH and
-            # falls back to "none" -> "none: command not found". Point it at the
-            # build-host compiler explicitly (emits target-arch dasm headers via
-            # IR_TARGET, so this is correct cross too).
+            # on the BUILD host, so configure probes for a second, build-machine
+            # compiler: under `cross_compiling`, `AC_CHECK_PROGS(BUILD_CC, [gcc
+            # clang c99 c89 cc cl])`, falling back to the literal "none".
+            #
+            # This export predates the engine, when the failure was that fallback
+            # ("none: command not found") because a gcc cross put only
+            # triple-prefixed names in PATH. Under the engine the failure is the
+            # opposite and quieter: the engine cc ships BARE `gcc`/`clang`/`cc`
+            # (they are the same wrapper with a baked `-target`), so the probe
+            # finds `gcc` on the first candidate and hands the build-host tools a
+            # compiler that emits TARGET code. Both ways the export is the fix,
+            # and the probe honors it — autoconf short-circuits the search with
+            # `ac_cv_prog_BUILD_CC="$BUILD_CC" # Let the user override the test.`
+            #
+            # nix-lib presets BUILD_CC too, but only where meson can mislabel the
+            # build cpu (aarch32/i686 hosts) and only with `:=`; a package's own
+            # preConfigure runs BEFORE preConfigureHooks, so this one wins on
+            # every host and keeps covering the ones that gate out.
+            # (Emits target-arch dasm headers via IR_TARGET, so correct cross too.)
             export BUILD_CC=${pkgs.buildPackages.stdenv.cc}/bin/cc
           '';
 
