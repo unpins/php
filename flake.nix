@@ -149,15 +149,18 @@
             # generic.nix bakes PROG_SENDMAIL=${system-sendmail}/bin/sendmail (a
             # store path mail() would exec). Repoint to the conventional system
             # location so the relocatable binary carries no store ref; overridable
-            # at runtime via the sendmail_path ini.
+            # at runtime via the sendmail_path ini. The store flag itself is
+            # filtered out below, or system-sendmail stays a build input (and on
+            # the crosses drags a cross acl/attr for nothing).
             "PROG_SENDMAIL=/usr/sbin/sendmail"
           ]
           # fpm's optional ACL feature (listen.acl_users on the unix socket) pulls
           # libacl. generic.nix adds the NON-static `acl` as a buildInput and
           # passes --with-fpm-acl, which would drag a dynamic libacl into the
           # static link. ACL-on-socket is marginal for a relocatable binary, so
-          # turn it off (last --with/--without wins); fpm itself stays fully
-          # functional. Revisit with pkgsStatic.acl if socket ACLs are ever wanted.
+          # turn it off (last --with/--without wins) and drop the input below;
+          # fpm itself stays fully functional. Revisit with pkgsStatic.acl if
+          # socket ACLs are ever wanted.
           ++ lib.optional pkgs.stdenv.hostPlatform.isLinux "--without-fpm-acl";
 
           # curl with psl off: libpsl bakes a store path to the public-suffix-list
@@ -275,11 +278,15 @@
           # error_reporting) was silently ignored. /etc is where PHP looks on
           # every distro; the scan dir follows the same convention. Same class as
           # e2fsprogs' mke2fs.conf and mtools' --sysconfdir.
-          configureFlags = (old.configureFlags or [ ]) ++ extConfigure ++ [
+          configureFlags = builtins.filter (f: !lib.hasPrefix "PROG_SENDMAIL=" f)
+            (old.configureFlags or [ ]) ++ extConfigure ++ [
             "--with-config-file-path=/etc"
             "--with-config-file-scan-dir=/etc/php.d"
           ];
           buildInputs = (old.buildInputs or [ ]) ++ extInputs;
+          # The static stdenv has already moved generic.nix's buildInputs here.
+          propagatedBuildInputs = builtins.filter (x: (x.pname or "") != "acl")
+            (old.propagatedBuildInputs or [ ]);
 
           # PHP's fopencookie seeker test can't run under cross (pkgsStatic =
           # glibc-build -> musl-host), so configure guesses from the host triple:
