@@ -125,6 +125,20 @@ let
       sed -i 's/#if defined(ZEND_WIN32) || defined(HAVE_SYNC_ATOMICS)/#if defined(_MSC_VER) || defined(HAVE_SYNC_ATOMICS)/; s/^#ifdef ZEND_WIN32$/#ifdef _MSC_VER/' Zend/zend_atomic.h Zend/zend_atomic.c
       sed -i 's/^typedef int pid_t;/#ifdef _MSC_VER\ntypedef int pid_t;\n#endif/' main/php.h Zend/zend_alloc.c
       sed -i 's/Ui64/ULL/g; s/\bi64\b/LL/g' win32/time.c
+      # win32/time.h re-declares `struct timezone` outright and `struct timespec`
+      # behind an MSVC-only version test, both of which the engine's mingw
+      # headers already define. Defer to the headers' own guards.
+      sed -i -e 's|^struct timezone {|#ifndef _TIMEZONE_DEFINED\n#define _TIMEZONE_DEFINED\nstruct timezone {|' \
+             -e 's|^struct itimerval {|#endif\n\nstruct itimerval {|' \
+             -e 's|^#if !defined(timespec) \&\& _MSC_VER < 1900$|#if !defined(timespec) \&\& !defined(_TIMESPEC_DEFINED) \&\& _MSC_VER < 1900|' \
+             win32/time.h
+      grep -q '_TIMESPEC_DEFINED' win32/time.h && grep -q '_TIMEZONE_DEFINED' win32/time.h \
+        || { echo "win32/time.h guards not applied" >&2; exit 1; }
+      # …and PHP's own nanosleep(), which the engine's mingw provides. Drop
+      # both halves: callers link the platform's, which is the real one.
+      sed -i '/^PHPAPI int nanosleep( const struct timespec \* rqtp, struct timespec \* rmtp );$/d' win32/time.h
+      sed -i '/^PHPAPI int nanosleep( const struct timespec \* rqtp, struct timespec \* rmtp )$/,/^}\/\*}}}\*\/$/d' win32/time.c
+      grep -q nanosleep win32/time.c && { echo "php nanosleep not dropped" >&2; exit 1; } || true
       find . -name '*.h' -exec sed -i -E 's/(#[[:space:]]*define[[:space:]]+[A-Z_]*API[A-Z0-9_]*)[[:space:]]+__declspec\(dll(export|import)\)/\1/g' {} +
       sed -i '/^#define PHP_WIN32_WINUTIL_H/a #include <windows.h>' win32/winutil.h
       sed -i '0,/#include "php.h"/s||#include "php.h"\n#ifdef PHP_WIN32\n#include "win32/winutil.h"\n#endif|' main/main.c
@@ -167,7 +181,25 @@ let
       runHook preBuild
       CC=$(echo ${stdenv.cc}/bin/*-gcc)
       NM=${binutils}/bin/x86_64-w64-mingw32-nm
-      OBJCOPY=${binutils}/bin/x86_64-w64-mingw32-objcopy
+      # The engine compiles every object to bitcode, which the binutils nm and
+      # objcopy do not read. `llvm nm` does, and a symbol rename that objcopy
+      # would write into a COFF symtab is a rename in the IR instead.
+      MT=${ulib.llvmMultitool pkgs.stdenv.buildPlatform.system}
+      isbc() { case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in 4243c0de|dec0170b) return 0;; *) return 1;; esac; }
+      # irrename <object> <old>=<new> ...
+      irrename() {
+        local o="$1"; shift
+        isbc "$o" || return 0
+        local a sedargs=()
+        for a in "$@"; do
+          sedargs+=(-e "s/@''${a%%=*}\\b/@''${a#*=}/g")
+        done
+        [ ''${#sedargs[@]} -gt 0 ] || return 0
+        $MT opt -S "$o" -o "$o.ll"
+        sed -i "''${sedargs[@]}" "$o.ll"
+        $MT opt "$o.ll" -o "$o"
+        rm -f "$o.ll"
+      }
       EXTINC="-Iext/mbstring -Iext/mbstring/libmbfl -Iext/mbstring/libmbfl/mbfl ${incDirs}"
       INC="-I. -Imain -IZend -ITSRM -Imain/streams -Iext/date/lib -Iext/hash/sha3/generic64lc -I${lib.getDev S.pcre2}/include $EXTINC -Iopenssl-applink-stub -Isapi/cgi -Isapi/phpdbg"
       DEF="-include time.h -DPHP_WIN32=1 -DZEND_WIN32=1 -DPHP_EXPORTS=1 -DLIBZEND_EXPORTS=1 -DCWD_EXPORTS=1 -DTSRM_EXPORTS=1 -DSAPI_EXPORTS=1 -D_WIN32_WINNT=0x0602 -DWIN32 -D_USE_MATH_DEFINES -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1 -DKeccakP200_excluded -DKeccakP400_excluded -DKeccakP800_excluded -Wno-error=format-security -Wno-format-security -Wno-error=incompatible-pointer-types"
@@ -192,6 +224,10 @@ let
       CLI_SRCS="sapi/cli/php_cli.c sapi/cli/php_cli_server.c sapi/cli/ps_title.c sapi/cli/php_http_parser.c sapi/cli/php_cli_process_title.c"
       CGI_SRCS="sapi/cgi/cgi_main.c"
       PHPDBG_SRCS="sapi/phpdbg/phpdbg.c sapi/phpdbg/phpdbg_prompt.c sapi/phpdbg/phpdbg_cmd.c sapi/phpdbg/phpdbg_info.c sapi/phpdbg/phpdbg_help.c sapi/phpdbg/phpdbg_break.c sapi/phpdbg/phpdbg_print.c sapi/phpdbg/phpdbg_bp.c sapi/phpdbg/phpdbg_list.c sapi/phpdbg/phpdbg_utils.c sapi/phpdbg/phpdbg_set.c sapi/phpdbg/phpdbg_frame.c sapi/phpdbg/phpdbg_watch.c sapi/phpdbg/phpdbg_win.c sapi/phpdbg/phpdbg_btree.c sapi/phpdbg/phpdbg_parser.c sapi/phpdbg/phpdbg_lexer.c sapi/phpdbg/phpdbg_sigsafe.c sapi/phpdbg/phpdbg_io.c sapi/phpdbg/phpdbg_out.c"
+      # One compile, in its own subshell so the loop below can run a screenful of
+      # them at once. A failure is a file in `fails/`, not a shell variable: the
+      # count has to survive the subshell.
+      mkdir -p fails
       compile_one() {
         srcfile="$1"; extra="$2"
         [ -f "$srcfile" ] || return 0
@@ -199,21 +235,35 @@ let
         case "$srcfile" in *hash_sha_ni.c) extra="$extra -msha -mssse3 -msse4.2";; esac
         o="obj/$(echo $srcfile|tr / _).o"
         if ! $CC $DEF $EXTDEF $INC $extra -c "$srcfile" -o "$o" 2>"$o.err"; then
-          fail=$((fail+1)); echo "FAIL $srcfile"; grep -iE "error:|fatal error:" "$o.err" | head -2
+          : > "fails/$(echo $srcfile|tr / _)"
+          echo "FAIL $srcfile"; grep -iE "error:|fatal error:" "$o.err" | head -2
         fi
       }
-      for s in $CORE_SRCS $CLI_SRCS $CGI_SRCS; do compile_one "$s" ""; done
-      for s in $PHPDBG_SRCS; do compile_one "$s" "-DYY_NO_UNISTD_H"; done
+      # PHP has ~700 of these and they were compiled one at a time, which is
+      # most of this build's wall clock. `wait -n` keeps NIX_BUILD_CORES in
+      # flight; output stays per-file because compile_one prints only on failure.
+      compile_all() {
+        local __extra="$1"; shift
+        local s
+        for s in "$@"; do
+          while [ "$(jobs -rp | wc -l)" -ge "$NIX_BUILD_CORES" ]; do wait -n; done
+          compile_one "$s" "$__extra" &
+        done
+        wait
+      }
+      compile_all "" $CORE_SRCS $CLI_SRCS $CGI_SRCS
+      compile_all "-DYY_NO_UNISTD_H" $PHPDBG_SRCS
+      fail=$(ls fails | wc -l)
       for s in Zend/asm/jump_x86_64_ms_pe_gas.S Zend/asm/make_x86_64_ms_pe_gas.S; do
         $CC -c "$s" -o "obj/$(echo $s|tr / _).o"
       done
       if [ "$fail" -ne 0 ]; then echo "ABORT: $fail source(s) failed to compile" >&2; exit 1; fi
 
       # ---- MULTICALL: rename each sapi main, then genuine cross-sapi dups ----
-      $OBJCOPY --redefine-sym main=unpin_cli_main    obj/sapi_cli_php_cli.c.o
-      $OBJCOPY --redefine-sym main=unpin_cgi_main    obj/sapi_cgi_cgi_main.c.o
-      $OBJCOPY --redefine-sym main=unpin_phpdbg_main obj/sapi_phpdbg_phpdbg.c.o
-      defsof(){ for o in $1; do $NM -g --defined-only "$o" 2>/dev/null; done | awk '$2 ~ /^[TtDdBbRr]$/ {print $3}' | sort -u; }
+      irrename obj/sapi_cli_php_cli.c.o   main=unpin_cli_main
+      irrename obj/sapi_cgi_cgi_main.c.o  main=unpin_cgi_main
+      irrename obj/sapi_phpdbg_phpdbg.c.o main=unpin_phpdbg_main
+      defsof(){ for o in $1; do $MT llvm-nm -g --defined-only "$o" 2>/dev/null; done | awk '$2 ~ /^[TtDdBbRrVvWw]$/ {print $3}' | sort -u; }
       defsof "$(ls obj/sapi_cli_*.o)"    > defs_cli
       defsof "$(ls obj/sapi_cgi_*.o)"    > defs_cgi
       defsof "$(ls obj/sapi_phpdbg_*.o)" > defs_phpdbg
@@ -225,7 +275,9 @@ let
         : > redef_$grp
         while read s; do [ -n "$s" ] && echo "$s ''${grp}_$s" >> redef_$grp; done < dups
         if [ -s redef_$grp ]; then
-          for o in $(ls obj/sapi_''${grp}_*.o); do $OBJCOPY --redefine-syms=redef_$grp "$o"; done
+          __pairs=""
+          while read -r __from __to; do __pairs="$__pairs $__from=$__to"; done < redef_$grp
+          for o in $(ls obj/sapi_''${grp}_*.o); do irrename "$o" $__pairs; done
         fi
       done
       $CC $DEF $INC -c unpin_dispatch_win.c -o obj/unpin_dispatch_win.o
@@ -237,14 +289,13 @@ let
       runHook postBuild
     '';
 
-    # Install as bin/php (+ alias symlinks) so withAliases can harvest the alias
-    # names; windowsBuild renames bin/php → bin/php.exe afterwards (lua pattern).
+    # Install as bin/php.exe. The alias names are no longer harvested from
+    # symlinks here: the flake declares them (multicall.programs), and nix-lib's
+    # embed is the single place that writes them into the payload.
     installPhase = ''
       runHook preInstall
       mkdir -p "$out/bin"
-      install -m755 php.exe "$out/bin/php"
-      ln -s php "$out/bin/php-cgi"
-      ln -s php "$out/bin/phpdbg"
+      install -m755 php.exe "$out/bin/php.exe"
       runHook postInstall
     '';
 
@@ -254,15 +305,5 @@ let
     };
   };
 
-  # Embed the alias list (php-cgi, phpdbg) for the `unpin` tool, then give the
-  # binary its .exe extension. Mirrors lua/multicall.nix's windows finalization.
-  aliased = ulib.withAliases pkgs {
-    primary = "php";
-    aliasesFromSymlinksIn = "bin";
-  } multicall;
 in
-aliased.overrideAttrs (o: {
-  postFixup = (o.postFixup or "") + ''
-    [ -f "$out/bin/php" ] && mv "$out/bin/php" "$out/bin/php.exe"
-  '';
-})
+multicall

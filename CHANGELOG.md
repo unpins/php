@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The Windows binary is now built by the same compiler as the Linux and macOS
+  ones. It is about 29% smaller (26.0 MB to 18.4 MB); all three programs were
+  checked under Wine — `php -v`, `php -r` arithmetic, `--unpin-program=php-cgi`
+  and `phpdbg` by name — along with every one of the 21 extensions it loads
+  (curl, openssl, mbstring, pcre, gmp, sodium, bz2, zip, iconv, gettext, hash,
+  json, date, PDO/sqlite and the rest), each answering exactly what the
+  previous binary answers.
+
+  It now uses the Universal C Runtime, which is part of Windows 10 and later.
+  On Windows 7 or 8.1 that runtime has to be installed first — it comes through
+  Windows Update. The previous binary did not need it.
+
+- `unpin install php` now also creates `php` itself, beside `php-cgi`,
+  `phpdbg` and (off Windows) `php-fpm`. The list of names the binary carries
+  is declared in one place now and names all of them.
+
 ### Fixed
 
 - Weak references no longer crash the 32-bit x86 build. Storing an object in a

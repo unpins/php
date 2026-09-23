@@ -29,6 +29,19 @@
     let
       ulib = unpins-lib.lib;
 
+      # The windows fold's dispatch table, declared once: windows.nix renders
+      # the dispatcher from these three sapis and `multicall.windowsTable` hands
+      # the same value to CI, so the .exe and the declaration cannot drift.
+      # `fn` is the C entry each sapi's `main` is renamed to.
+      winTable = ulib.multicallTable {
+        name = "php";
+        applets = [
+          { name = "php"; fn = "unpin_cli_main"; }
+          { name = "php-cgi"; fn = "unpin_cgi_main"; }
+          { name = "phpdbg"; fn = "unpin_phpdbg_main"; }
+        ];
+      };
+
       # PHP is C; build it under the unpin-llvm engine (clang/lld, static musl,
       # single multicall binary). Its deps stay ordinary pkgsStatic `.a`s (built
       # by the set-wide engine swap) linked as external native archives.
@@ -643,6 +656,22 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
       # binary stays inside the darwin portability allow-list, matching how the
       # pre-engine full-SDK build linked it (see the darwin LDFLAGS above).
       engine = "unpin-llvm";
+      # php folds its own sapis on BOTH halves (unpin-multicall.mk natively,
+      # windows.nix for the `.exe`), so nix-lib emits no bitcode module; the
+      # block is here to put the `.exe` on the engine too, instead of the
+      # nixpkgs mingw-gcc cross, and to state the program list in one place.
+      # fpm is a POSIX daemon — fork, signals, setuid — so it is not on windows.
+      multicall = {
+        windows = true;
+        module = false;
+        windowsTable = winTable;
+        programs = [
+          { name = "php"; }
+          { name = "php-cgi"; }
+          { name = "phpdbg"; }
+          { name = "php-fpm"; supportedTarget = h: !(h.isWindows or false); }
+        ];
+      };
       # Four manuals ride along, one per program the binary answers to: php.1,
       # php-cgi.1, phpdbg.1 and php-fpm.8. The base installs two more, for the
       # `phar` tool that postInstall deletes; they go with it.
