@@ -81,7 +81,9 @@ The [Releases](https://github.com/unpins/php/releases) page has standalone binar
   trust roots come from `SSL_CERT_FILE` / the system store at runtime, so no CA
   bundle or `/nix/store` path is baked in.
 - **Windows** is a mingw build of PHP's own `win32` sources (no MSVC); the `.exe`
-  is self-contained, importing only system DLLs.
+  is self-contained, importing only system DLLs. It has the same extensions as
+  Linux and macOS, OPcache + JIT and readline included, except `pcntl` and
+  `posix`, which exist only on POSIX systems.
 - **No PEAR or `phar` wrapper.** PEAR is a runtime package manager and the `phar`
   tool hardcodes a non-relocatable path to `bin/php`; both are dropped. The Phar
   *extension* is compiled in, so `Phar::` still works from PHP.

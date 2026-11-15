@@ -29,6 +29,14 @@ let
   # not the scope. C:/ssl is the value that package uses.
   S = (ulib.mingwStaticCross pkgs).extend (final: prev: {
     openssl = prev.openssl.overrideAttrs (ulib.retargetOpenssl "C:/ssl");
+    # readline's terminal.c and termcap both define the global `PC` (and
+    # BC/UP); as a common symbol readline's copy yields to termcap's instead
+    # of colliding in the static link.
+    readline = prev.readline.overrideAttrs (o: {
+      env = (o.env or { }) // {
+        NIX_CFLAGS_COMPILE = toString ((o.env.NIX_CFLAGS_COMPILE or "") + " -fcommon");
+      };
+    });
   });
   stdenv = S.stdenv;
   binutils = pkgs.pkgsCross.mingwW64.buildPackages.binutils;
@@ -58,6 +66,7 @@ let
     S.openssl S.sqlite S.gmp S.libsodium S.bzip2 S.gettext S.libiconv
     (allowWin S.oniguruma) (allowWin S.libzip) curlSchannel
     S.pcre2 S.zlib S.nghttp2 S.libidn2 S.libpsl S.zstd S.brotli S.libunistring
+    S.libxml2 S.readline S.termcap
   ];
   incDirs = builtins.concatStringsSep " " (map (p: "-I${lib.getDev p}/include") depOut);
   # .a archives live in the `out`/`lib` output — curl/openssl/sqlite default to
@@ -71,6 +80,10 @@ let
     src = pkgs.php84.unwrapped.src;
 
     nativeBuildInputs = [ binutils ];
+    # OPcache built in, as on Linux and macOS: the same static-php-cli patch
+    # (it carries the Windows half too). It registers the zend_extension at
+    # startup when HAVE_OPCACHE is defined and COMPILE_DL_OPCACHE is not.
+    patches = [ ./static_opcache_84.patch ];
     dontConfigure = true;
     # We compile with the bare cross gcc and explicit -I/-L (the proven probe
     # recipe), so the stdenv wrapper's auto-CFLAGS don't apply to our objects.
@@ -112,6 +125,28 @@ let
       #define HAVE_NGETTEXT 1
       #define HAVE_LIBINTL 1
       #define HAVE_DCNGETTEXT 1
+      #define HAVE_CTYPE 1
+      #define HAVE_PHP_SESSION 1
+      #define HAVE_BCMATH 1
+      #define HAVE_CALENDAR 1
+      #define HAVE_ZLIB 1
+      #define HAVE_EXIF 1
+      #define HAVE_FTP 1
+      #define HAVE_FTP_SSL 1
+      #define HAVE_SOCKETS 1
+      #define PHAR_HAVE_OPENSSL 1
+      #define HAVE_LIBXML 1
+      #define HAVE_DOM 1
+      #define HAVE_XML 1
+      #define HAVE_SIMPLEXML 1
+      #define HAVE_XMLREADER 1
+      #define HAVE_XMLWRITER 1
+      #define HAVE_SOAP 1
+      #define HAVE_OPCACHE 1
+      #define HAVE_JIT 1
+      #define HAVE_LIBREADLINE 1
+      #define HAVE_RL_COMPLETION_MATCHES 1
+      #define HAVE_HISTORY_LIST 1
       EOF
       # config.w32.h.in additions above are indented by the Nix heredoc; strip
       # the leading whitespace so the #defines are valid preprocessor lines.
@@ -148,14 +183,39 @@ let
       # _MSC_VER so mingw keeps plain execute_ex (its CALL VM saves XMM normally).
       sed -i 's/#if defined(_WIN64) \&\& defined(_M_X64)$/#if defined(_WIN64) \&\& defined(_M_X64) \&\& defined(_MSC_VER)/' Zend/zend_vm_execute.h
       # header case (mingw-on-linux is case-sensitive; PHP uses CamelCase names).
-      grep -rlE 'Ws2tcpip\.h|Winsock2\.h|Windows\.h|Mmsystem\.h|Wincrypt\.h|Mswsock\.h|Shlwapi\.h|Winuser\.h|Sddl\.h|WinBase\.h|Winbase\.h|Windns\.h' main Zend TSRM win32 ext sapi 2>/dev/null \
-        | xargs -r sed -i 's/Ws2tcpip\.h/ws2tcpip.h/g; s/Winsock2\.h/winsock2.h/g; s/Windows\.h/windows.h/g; s/Mmsystem\.h/mmsystem.h/g; s/Wincrypt\.h/wincrypt.h/g; s/Mswsock\.h/mswsock.h/g; s/Shlwapi\.h/shlwapi.h/g; s/Winuser\.h/winuser.h/g; s/Sddl\.h/sddl.h/g; s/WinBase\.h/winbase.h/g; s/Winbase\.h/winbase.h/g; s/Windns\.h/windns.h/g'
+      grep -rlE 'Ws2tcpip\.h|Winsock2\.h|Windows\.h|Mmsystem\.h|Wincrypt\.h|Mswsock\.h|Shlwapi\.h|Winuser\.h|Sddl\.h|WinBase\.h|Winbase\.h|Windns\.h|IPHlpApi\.h' main Zend TSRM win32 ext sapi 2>/dev/null \
+        | xargs -r sed -i 's/Ws2tcpip\.h/ws2tcpip.h/g; s/Winsock2\.h/winsock2.h/g; s/Windows\.h/windows.h/g; s/Mmsystem\.h/mmsystem.h/g; s/Wincrypt\.h/wincrypt.h/g; s/Mswsock\.h/mswsock.h/g; s/Shlwapi\.h/shlwapi.h/g; s/Winuser\.h/winuser.h/g; s/Sddl\.h/sddl.h/g; s/WinBase\.h/winbase.h/g; s/Winbase\.h/winbase.h/g; s/Windns\.h/windns.h/g; s/IPHlpApi\.h/iphlpapi.h/g'
       sed -i 's@\.h >@.h>@g' ext/standard/dns_win32.c
       # phpdbg wraps main() in MSVC SEH (__try/__except) for a crash backtrace —
       # mingw-gcc has no __try. The two are the only bare `#ifdef _WIN32` in the
       # file; gate them on _MSC_VER so both brace-halves vanish together for mingw.
       sed -i 's/^#ifdef _WIN32$/#ifdef _MSC_VER/' sapi/phpdbg/phpdbg.c
-      # mbstring's bundled libmbfl needs its win32 config header.
+      # ext/sockets expects the Windows SDK's ws2def.h, which spells the
+      # control-message API the POSIX way (cmsghdr, CMSG_*). mingw only has the
+      # WSA_CMSG_* originals, in mswsock.h; alias them the same way.
+      sed -i 's|^#define HAVE_IF_NAMETOINDEX 1$|#include <mswsock.h>\n#ifndef CMSG_SPACE\n#define cmsghdr _WSACMSGHDR\n#define CMSG_FIRSTHDR WSA_CMSG_FIRSTHDR\n#define CMSG_NXTHDR WSA_CMSG_NXTHDR\n#define CMSG_DATA WSA_CMSG_DATA\n#define CMSG_SPACE WSA_CMSG_SPACE\n#define CMSG_LEN WSA_CMSG_LEN\n#endif\n&|' ext/sockets/windows_common.h
+      grep -q 'define CMSG_SPACE WSA_CMSG_SPACE' ext/sockets/windows_common.h \
+        || { echo "sockets cmsg aliases not applied" >&2; exit 1; }
+      # OPcache: the JIT's 64-bit bitset constant is spelled `1ui64` under
+      # _M_X64, which mingw's headers define but only MSVC parses; `1ULL` is
+      # the same value. The static-opcache patch re-declares
+      # zend_register_extension with a `void *` handle, which conflicts with
+      # Windows' HMODULE; zend_extensions.h already declares it.
+      substituteInPlace ext/opcache/jit/ir/ir_private.h --replace-fail '1ui64' '1ULL'
+      substituteInPlace ext/opcache/shared_alloc_win32.c --replace-fail '<LMCONS.H>' '<lmcons.h>'
+      substituteInPlace main/main.c \
+        --replace-fail 'extern void zend_register_extension(zend_extension *new_extension, void *handle);' ""
+      # readline: upstream's Windows build links WinEditLine, which nixpkgs
+      # does not have; GNU readline (with termcap) builds for mingw and the
+      # extension compiles against it. Its Windows path finds the cli's shell
+      # callbacks with GetProcAddress, which sees nothing in a static .exe;
+      # call the cli directly (all three programs are this one binary, and
+      # the sapi-name check above it still keeps cgi/phpdbg out). The
+      # library line in phpinfo() names WinEditLine unconditionally.
+      substituteInPlace ext/readline/readline_cli.c \
+        --replace-fail '(get_cli_shell_callbacks)GetProcAddress(hMod, "php_cli_get_shell_callbacks")' 'php_cli_get_shell_callbacks' \
+        --replace-fail 'php_info_print_table_row(2, "Readline library", "WinEditLine");' \
+                       'php_info_print_table_row(2, "Readline library", rl_library_version);'
       cp ext/mbstring/libmbfl/config.h.w32 ext/mbstring/libmbfl/config.h
       # generated files configure.js would normally emit.
       cp ${./internal_functions_win.c} main/internal_functions.c
@@ -201,9 +261,9 @@ let
         rm -f "$o.ll"
       }
       EXTINC="-Iext/mbstring -Iext/mbstring/libmbfl -Iext/mbstring/libmbfl/mbfl ${incDirs}"
-      INC="-I. -Imain -IZend -ITSRM -Imain/streams -Iext/date/lib -Iext/hash/sha3/generic64lc -I${lib.getDev S.pcre2}/include $EXTINC -Iopenssl-applink-stub -Isapi/cgi -Isapi/phpdbg"
+      INC="-I. -Imain -IZend -ITSRM -Imain/streams -Iext/date/lib -Iext/hash/sha3/generic64lc -I${lib.getDev S.pcre2}/include $EXTINC -Iopenssl-applink-stub -Isapi/cgi -Isapi/phpdbg -I${lib.getDev S.libxml2}/include/libxml2 -Iext/dom/lexbor"
       DEF="-include time.h -DPHP_WIN32=1 -DZEND_WIN32=1 -DPHP_EXPORTS=1 -DLIBZEND_EXPORTS=1 -DCWD_EXPORTS=1 -DTSRM_EXPORTS=1 -DSAPI_EXPORTS=1 -D_WIN32_WINNT=0x0602 -DWIN32 -D_USE_MATH_DEFINES -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1 -DKeccakP200_excluded -DKeccakP400_excluded -DKeccakP800_excluded -Wno-error=format-security -Wno-format-security -Wno-error=incompatible-pointer-types"
-      EXTDEF="-DCURL_STATICLIB -DPHP_CURL_EXPORTS=1 -DSODIUM_STATIC=1 -DZIP_STATIC=1 -DLZMA_API_STATIC -DHAVE_SET_MTIME -DHAVE_ENCRYPTION -DHAVE_LIBZIP_VERSION -DHAVE_PROGRESS_CALLBACK -DHAVE_CANCEL_CALLBACK -DHAVE_METHOD_SUPPORTED -DHAVE_STRICMP -DMBFL_DLL_EXPORT=1 -DONIG_EXTERN=extern -DPHP_ONIG_BAD_KOI8_ENTRY=1 -DONIG_STATIC=1 -DPHP_ICONV_EXPORTS -DPHP_ICONV_IMPL=\"libiconv\" -DLIBXML_STATIC"
+      EXTDEF="-DCURL_STATICLIB -DPHP_CURL_EXPORTS=1 -DSODIUM_STATIC=1 -DZIP_STATIC=1 -DLZMA_API_STATIC -DHAVE_SET_MTIME -DHAVE_ENCRYPTION -DHAVE_LIBZIP_VERSION -DHAVE_PROGRESS_CALLBACK -DHAVE_CANCEL_CALLBACK -DHAVE_METHOD_SUPPORTED -DHAVE_STRICMP -DMBFL_DLL_EXPORT=1 -DONIG_EXTERN=extern -DPHP_ONIG_BAD_KOI8_ENTRY=1 -DONIG_STATIC=1 -DPHP_ICONV_EXPORTS -DPHP_ICONV_IMPL=\"libiconv\" -DLIBXML_STATIC -DLEXBOR_STATIC -DPHP_SOCKETS_EXPORTS=1"
       mkdir -p obj; fail=0
       EXCL="sapi/cli/cli_win32.c Zend/Optimizer/ssa_integrity.c win32/cp_enc_map.c win32/cp_enc_map_gen.c win32/dllmain.c main/php_odbc_utils.c main/debug_gdb_scripts.c Zend/zend_gdb.c ext/standard/crc32_x86.c"
       CORE_SRCS="win32/*.c main/*.c main/streams/*.c Zend/*.c Zend/Optimizer/*.c TSRM/*.c \
@@ -221,6 +281,23 @@ let
             ext/gmp/gmp.c ext/sodium/libsodium.c ext/sodium/sodium_pwhash.c \
             ext/bz2/bz2.c ext/bz2/bz2_filter.c ext/zip/php_zip.c ext/zip/zip_stream.c \
             ext/gettext/gettext.c ext/iconv/iconv.c"
+      # The extensions with no MSVC-only code take their source lists from
+      # upstream's own config.w32 (what configure.js would compile), so a
+      # version bump that adds a file needs no edit here.
+      w32srcs() {
+        sed -e ':a' -e '/\\$/{N;s/\\\n//;ba' -e '}' "ext/$1/config.w32" \
+          | grep -vE '^[[:space:]]*//' \
+          | sed -nE "s#.*\b(EXTENSION|ADD_SOURCES)\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*,[[:space:]]*[\"']([^\"']*)[\"'].*#\1|\2|\3#p" \
+          | while IFS='|' read -r kind first files; do
+              if [ "$kind" = EXTENSION ]; then dir="ext/$first"; else dir=$(printf %s "$first" | tr '\\' /); fi
+              for f in $files; do printf '%s/%s\n' "$dir" "$f"; done
+            done
+      }
+      W32_EXTS="ctype tokenizer session filter bcmath calendar phar zlib exif ftp sockets libxml dom xml simplexml xmlreader xmlwriter soap readline"
+      EXT_SRCS=$(for e in $W32_EXTS; do w32srcs $e; done)
+      [ "$(echo "$EXT_SRCS" | wc -l)" -gt 250 ] || { echo "w32srcs found too few sources" >&2; exit 1; }
+      # fileinfo names its libmagic sources through a variable.
+      FILEINFO_SRCS="ext/fileinfo/fileinfo.c ext/fileinfo/php_libmagic.c $(ls ext/fileinfo/libmagic/*.c)"
       CLI_SRCS="sapi/cli/php_cli.c sapi/cli/php_cli_server.c sapi/cli/ps_title.c sapi/cli/php_http_parser.c sapi/cli/php_cli_process_title.c"
       CGI_SRCS="sapi/cgi/cgi_main.c"
       PHPDBG_SRCS="sapi/phpdbg/phpdbg.c sapi/phpdbg/phpdbg_prompt.c sapi/phpdbg/phpdbg_cmd.c sapi/phpdbg/phpdbg_info.c sapi/phpdbg/phpdbg_help.c sapi/phpdbg/phpdbg_break.c sapi/phpdbg/phpdbg_print.c sapi/phpdbg/phpdbg_bp.c sapi/phpdbg/phpdbg_list.c sapi/phpdbg/phpdbg_utils.c sapi/phpdbg/phpdbg_set.c sapi/phpdbg/phpdbg_frame.c sapi/phpdbg/phpdbg_watch.c sapi/phpdbg/phpdbg_win.c sapi/phpdbg/phpdbg_btree.c sapi/phpdbg/phpdbg_parser.c sapi/phpdbg/phpdbg_lexer.c sapi/phpdbg/phpdbg_sigsafe.c sapi/phpdbg/phpdbg_io.c sapi/phpdbg/phpdbg_out.c"
@@ -251,7 +328,24 @@ let
         done
         wait
       }
-      compile_all "" $CORE_SRCS $CLI_SRCS $CGI_SRCS
+      compile_all "" $CORE_SRCS $CLI_SRCS $CGI_SRCS $EXT_SRCS
+      compile_all "-Iext/fileinfo/libmagic -Iext/fileinfo" $FILEINFO_SRCS
+
+      # OPcache + JIT: sources and the two generated JIT headers as in
+      # ext/opcache/config.w32 and jit/Makefile.frag.w32, the generators built
+      # for the build machine.
+      IR=ext/opcache/jit/ir
+      HOSTCC=${pkgs.buildPackages.stdenv.cc}/bin/cc
+      $HOSTCC -O2 -o minilua $IR/dynasm/minilua.c -lm
+      ./minilua $IR/dynasm/dynasm.lua -D X64=1 -D X64WIN=1 -D WIN=1 -o $IR/ir_emit_x86.h $IR/ir_x86.dasc
+      $HOSTCC -DIR_TARGET_X64 -I$IR -o gen_ir_fold_hash $IR/gen_ir_fold_hash.c
+      ./gen_ir_fold_hash < $IR/ir_fold.h > $IR/ir_fold_hash.h
+      OPCACHE_SRCS="$(for f in ZendAccelerator zend_accelerator_blacklist zend_accelerator_debug \
+            zend_accelerator_hash zend_accelerator_module zend_accelerator_util_funcs zend_persist \
+            zend_persist_calc zend_file_cache zend_shared_alloc shared_alloc_win32 \
+            jit/zend_jit jit/zend_jit_vm_helpers; do echo ext/opcache/$f.c; done) \
+          $(for f in ir ir_emit ir_strtab ir_cfg ir_sccp ir_gcm ir_ra ir_save ir_dump ir_check ir_patch; do echo $IR/$f.c; done)"
+      compile_all "-Iext/opcache -Iext/opcache/jit -I$IR -DIR_TARGET_X64 -DIR_PHP" $OPCACHE_SRCS
       compile_all "-DYY_NO_UNISTD_H" $PHPDBG_SRCS
       fail=$(ls fails | wc -l)
       for s in Zend/asm/jump_x86_64_ms_pe_gas.S Zend/asm/make_x86_64_ms_pe_gas.S; do

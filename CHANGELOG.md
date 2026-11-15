@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The Windows binary had only 21 of the extensions the Linux and macOS ones
+  have. It now has the same set except `pcntl` and `posix`, which are
+  POSIX-only: `bcmath`, `calendar`, `ctype`, `dom` (with the HTML5 parser),
+  `exif`, `fileinfo`, `filter`, `ftp`, `libxml`, `Phar`, `readline` (so
+  `php -a` edits lines and keeps history), `session`, `SimpleXML`, `soap`,
+  `sockets`, `tokenizer`, `xml`, `xmlreader`, `xmlwriter`, `zlib`, and OPcache
+  with the JIT. The binary grows from 18.4 MB to 32.3 MB.
+
 ## [8.4.25-1] - 2026-09-26
 
 ### Changed
