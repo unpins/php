@@ -39,7 +39,6 @@ let
     });
   });
   stdenv = S.stdenv;
-  binutils = pkgs.pkgsCross.mingwW64.buildPackages.binutils;
 
   # curl over Schannel (Windows system TLS + system cert store), no OpenSSL in
   # the curl link chain — verbatim the recipe shipped in curl/flake.nix's
@@ -79,7 +78,6 @@ let
     inherit (pkgs.php84) version;
     src = pkgs.php84.unwrapped.src;
 
-    nativeBuildInputs = [ binutils ];
     # OPcache built in, as on Linux and macOS: the same static-php-cli patch
     # (it carries the Windows half too). It registers the zend_extension at
     # startup when HAVE_OPCACHE is defined and COMPILE_DL_OPCACHE is not.
@@ -240,7 +238,6 @@ let
     buildPhase = ''
       runHook preBuild
       CC=$(echo ${stdenv.cc}/bin/*-gcc)
-      NM=${binutils}/bin/x86_64-w64-mingw32-nm
       # The engine compiles every object to bitcode, which the binutils nm and
       # objcopy do not read. `llvm nm` does, and a symbol rename that objcopy
       # would write into a COFF symtab is a rename in the IR instead.
