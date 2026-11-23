@@ -3,7 +3,7 @@
  * Mirror of unpin_dispatch.c, but Windows-aware and fpm-free: PHP's fpm sapi
  * is a POSIX daemon (fork/signals/setuid) that does not exist on Windows, so
  * the Windows multicall folds in only cli + cgi + phpdbg. Each sapi's `main`
- * is renamed to unpin_<sapi>_main (objcopy --redefine-sym at link time); this
+ * is renamed to unpin_<sapi>_main (a rename in the bitcode IR); this
  * file owns the real main() and dispatches on either a leading
  * --unpin-program=NAME flag (bare-binary dispatch) or the argv[0] basename
  * (alias dispatch, e.g. php-cgi.exe), defaulting to the cli.

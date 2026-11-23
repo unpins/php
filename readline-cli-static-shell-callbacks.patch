@@ -1,0 +1,35 @@
+Reach the cli's shell callbacks without dlsym in a static binary.
+
+`php -a` answers "requires the readline extension" even though readline
+IS linked in and `php -m` lists it: the extension reaches the cli's
+callback table with dlsym(RTLD_DEFAULT, ...), and in a static binary that
+lookup returns NULL, so the shell is never registered. Upstream's own
+commented-out alternative right below the dlsym is the direct call, but
+taking it plainly breaks the three standalone sapi links that happen
+before the multicall relink: php_cli_get_shell_callbacks lives in the
+cli, and a weak *reference* is an ELF idea that ld64 rejects outright. A
+weak *definition* works on both formats: the cli's real function
+overrides it wherever the cli is linked (the cli itself and the
+multicall), and where it is not (cgi, fpm and phpdbg, none of which has
+an interactive shell) the callbacks come back NULL, exactly what the
+dlsym used to return there.
+
+--- a/ext/readline/readline_cli.c
++++ b/ext/readline/readline_cli.c
+@@ -52,6 +52,7 @@
+ 
+ #include "sapi/cli/cli.h"
+ #include "readline_cli.h"
++__attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) { return (cli_shell_callbacks_t *)0; }
+ 
+ #if defined(COMPILE_DL_READLINE) && !defined(PHP_WIN32)
+ #include <dlfcn.h>
+@@ -751,7 +752,7 @@
+ 	do { \
+ 		(cb) = NULL; \
+ 		cli_shell_callbacks_t *(*get_callbacks)(void); \
+-		get_callbacks = dlsym(RTLD_DEFAULT, "php_cli_get_shell_callbacks"); \
++		get_callbacks = php_cli_get_shell_callbacks; \
+ 		if (get_callbacks) { \
+ 			(cb) = get_callbacks(); \
+ 		} \

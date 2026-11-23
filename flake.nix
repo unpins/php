@@ -11,35 +11,29 @@
   # PHP CLI as ONE static binary. nixpkgs' `php` is a symlinkJoin/buildEnv that
   # loads extensions as runtime `.so` files (out-of-tree, via phpize) and wraps
   # bin/php with a PHP_INI_SCAN_DIR store path — both incompatible with a single
-  # relocatable binary. So we take the raw `./configure` build (`.unwrapped`),
-  # turn off the non-CLI sapis, and compile a curated "scripting essentials"
-  # extension set IN-TREE (real top-level configure flags) atop `--disable-all`.
+  # relocatable binary. So we take the raw `./configure` build (`.unwrapped`)
+  # and compile a curated extension set IN-TREE (real top-level configure
+  # flags) atop `--disable-all`; the four sapis fold into one binary.
   # PHP's stdlib is C, so — like lua — there is no tree of `.php` files to embed.
   #
   # IMPORTANT (eval blowup): do NOT route php through `pkgsStatic.php84`. The
   # static *overlay* re-instantiates php's whole extension fixpoint
   # (php-packages.nix's `phpPackage = phpWithExtensions` self-reference) and the
   # evaluator OOMs (>40 GB, unbounded). Instead we stay in the NON-static package
-  # set and swap only the derivation's `stdenv` to `pkgsStatic.stdenv` via
-  # `.override` — php-packages then resolves once in the non-overlaid fixpoint
-  # (cheap, ~1 s) while the core build still links static-musl. Individual static
+  # set and swap only the derivation's `stdenv` to the engine's (`engStdenv`)
+  # via `.override` — php-packages then resolves once in the non-overlaid
+  # fixpoint (cheap, ~1 s) while the core build still links static-musl. Individual static
   # deps (`pkgsStatic.curl`, …) are fine to reference; only php's own attribute
   # triggers the recursion.
   outputs = { self, unpins-lib }:
     let
       ulib = unpins-lib.lib;
 
-      # The windows fold's dispatch table, declared once: windows.nix renders
-      # the dispatcher from these three sapis and `multicall.windowsTable` hands
-      # the same value to CI, so the .exe and the declaration cannot drift.
-      # `fn` is the C entry each sapi's `main` is renamed to.
+      # The programs of the .exe, declared to CI. Its dispatcher is the
+      # hand-written unpin_dispatch_win.c, not rendered from this table.
       winTable = ulib.multicallTable {
         name = "php";
-        applets = [
-          { name = "php"; fn = "unpin_cli_main"; }
-          { name = "php-cgi"; fn = "unpin_cgi_main"; }
-          { name = "phpdbg"; fn = "unpin_phpdbg_main"; }
-        ];
+        applets = [ { name = "php"; } { name = "php-cgi"; } { name = "phpdbg"; } ];
       };
 
       # PHP is C; build it under the unpin-llvm engine (clang/lld, static musl,
@@ -54,19 +48,14 @@
       # trivial smoke. LTO is an optimization, not required for the single-binary
       # fold, so drop it for the whole package; revisit only behind a
       # JIT-exercising correctness gate.
-      # cxx = false: PHP is pure C. The libunwind dependency (see the -lc++ link
-      # trigger in mkPhp's preConfigure) is pulled at LINK time via the driver's
-      # wantsCxx detection, not this stdenv flag — the engine's link driver reads
-      # `cxx` from the link ARGS (clang++/`-lc++`/`.cpp` inputs), so this param
-      # only governs whether a C++ compiler is wired for compilation, which PHP
-      # doesn't use.
+      # cxx = true: intl is C++ (on top of ICU, itself C++).
       engStdenv = pkgs:
         let sp = pkgs.pkgsStatic; in
         ulib.unpinAdapterStdenv {
           inherit pkgs;
           target = sp.stdenv.hostPlatform.config;
           native = pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
-          cxx = false;
+          cxx = true;
           lto = false;
           captureLinks = true;
         };
@@ -75,12 +64,6 @@
         let
           s = pkgs.pkgsStatic;
           lib = pkgs.lib;
-
-          # The interactive CLI links readline -> ncurses(libtinfo), which bakes
-          # the terminfo store path in (same leak lua hit). Curate a fallback
-          # terminfo set into libtinfo.a + --disable-database.
-          ncursesFB = ulib.embedFallbackTerminfoOnly s.ncurses;
-          readlineFB = s.readline.override { ncurses = ncursesFB; };
 
           # darwin static-link iconv shim. The pkgsStatic darwin C libs PHP links
           # (libxml2, gettext's libintl, the iconv ext) are compiled against a
@@ -109,6 +92,11 @@
           };
 
           extConfigure = [
+            # configure otherwise adds `-Wl,-rpath,<dir>` for every library
+            # directory. A static ELF has no dynamic section to keep them in, but
+            # Mach-O does: the darwin binary carried an LC_RPATH per store path,
+            # dragging the whole build closure along with it.
+            "--disable-rpath"
             # zero-dep builtins
             "--enable-bcmath"
             "--enable-calendar"
@@ -129,8 +117,8 @@
             # ext/opcache/config.m4 hardcodes `ext_shared=yes` ("dnl Always build
             # as shared extension"), so a plain --enable-opcache still emits a
             # zend_extension .so (opcache.la) that can't link under the static-only
-            # stdenv. We flip that line to `ext_shared=no` in postPatch (the same
-            # approach static-php-cli uses) so opcache compiles in-tree. opcache is
+            # stdenv. static_opcache_84.patch flips that line to `ext_shared=no`
+            # (static-php-cli's patch) so opcache compiles in-tree. opcache is
             # the #1 perf feature for the long-running fpm/cgi sapis (SHM opcode
             # cache shared across workers); for the CLI it only helps via a
             # configured opcache.file_cache, but it's cheap to carry. JIT stays on
@@ -148,7 +136,7 @@
             "--enable-soap"
             # with-dep builtins
             "--with-openssl"
-            "--with-curl=${curlNoPsl.dev}"
+            "--with-curl=${s.curl.dev}"
             "--with-zlib"
             "--with-iconv"
             "--with-gmp=${gmp.dev}"
@@ -157,29 +145,44 @@
             "--with-bz2=${s.bzip2.dev}"
             "--with-sqlite3=${sqlite.dev}"
             "--with-pdo-sqlite=${sqlite.dev}"
-            "--with-readline=${readlineFB.dev}"
+            "--with-readline=${s.readline.dev}"
             "--with-zip"
+            # MySQL/MariaDB through PHP's own client (mysqlnd), no libmysqlclient.
+            "--enable-mysqlnd"
+            "--with-mysqli=mysqlnd"
+            "--with-pdo-mysql=mysqlnd"
+            # System V IPC and shared memory.
+            "--enable-sysvsem"
+            "--enable-sysvshm"
+            "--enable-sysvmsg"
+            "--enable-shmop"
+            # PostgreSQL through libpq.
+            "--with-pgsql"
+            "--with-pdo-pgsql"
+            # Images through PHP's bundled libgd.
+            "--enable-gd"
+            "--with-jpeg"
+            "--with-webp"
+            "--with-freetype"
+            "--with-avif"
+            "--enable-gd-jis-conv"
+            # Unicode and locales (Normalizer, Collator, IntlDateFormatter, …).
+            "--enable-intl"
+            # LDAP directories through OpenLDAP's client; SASL binds on Linux,
+            # as in nixpkgs.
+            "--with-ldap"
+            "LDAP_DIR=${s.openldap.dev}"
+            "LDAP_INCDIR=${s.openldap.dev}/include"
+            "LDAP_LIBDIR=${s.openldap.out}/lib"
             # generic.nix bakes PROG_SENDMAIL=${system-sendmail}/bin/sendmail (a
             # store path mail() would exec). Repoint to the conventional system
             # location so the relocatable binary carries no store ref; overridable
             # at runtime via the sendmail_path ini. The store flag itself is
-            # filtered out below, or system-sendmail stays a build input (and on
-            # the crosses drags a cross acl/attr for nothing).
+            # filtered out below, or system-sendmail stays a build input.
             "PROG_SENDMAIL=/usr/sbin/sendmail"
-          ]
-          # fpm's optional ACL feature (listen.acl_users on the unix socket) pulls
-          # libacl. generic.nix adds the NON-static `acl` as a buildInput and
-          # passes --with-fpm-acl, which would drag a dynamic libacl into the
-          # static link. ACL-on-socket is marginal for a relocatable binary, so
-          # turn it off (last --with/--without wins) and drop the input below;
-          # fpm itself stays fully functional. Revisit with pkgsStatic.acl if
-          # socket ACLs are ever wanted.
-          ++ lib.optional pkgs.stdenv.hostPlatform.isLinux "--without-fpm-acl";
-
-          # curl with psl off: libpsl bakes a store path to the public-suffix-list
-          # data file (.dat) — a runtime store leak. PSL only refines cookie-domain
-          # checks; dropping it removes the leak with negligible functional loss.
-          curlNoPsl = s.curl.override { pslSupport = false; };
+          ] ++ lib.optionals s.stdenv.hostPlatform.isLinux [
+            "--with-ldap-sasl"
+          ];
 
           # Darwin-engine CC_FOR_BUILD fix. Several autotools/autosetup deps run a
           # build-host codegen bootstrap that probes CC_FOR_BUILD (gmp's gen tool;
@@ -222,14 +225,36 @@
 
           sqlite = withDarwinBuildCC s.sqlite;
 
+          # gd's AVIF: libavif with its aom (encode) and dav1d (decode) codecs,
+          # through nix-lib's static fixes, as the avif package builds it.
+          libavif = ulib.nativeFixes.libavif (s.extend (final: prev:
+            { libyuv = ulib.nativeFixes.libyuv prev; }
+            // lib.optionalAttrs s.stdenv.hostPlatform.isDarwin {
+              dav1d = ulib.nativeFixes.dav1d prev;
+            }));
+
+          # nixpkgs picks libpq's CFLAGS by `cc.isClang`, which the engine cc
+          # does not claim, so darwin gets the GNU ld `-Wl,--gc-sections` and
+          # configure's first test link fails ("C compiler cannot create
+          # executables"). libpq installs only a static archive, so the flag
+          # does nothing there anyway.
+          libpq =
+            if s.stdenv.hostPlatform.isDarwin
+            then s.libpq.overrideAttrs (o: {
+              env = o.env // {
+                CFLAGS = lib.replaceStrings [ " -Wl,--gc-sections" ] [ "" ] o.env.CFLAGS;
+              };
+            })
+            else s.libpq;
+
           extInputs = [
-            curlNoPsl
+            s.curl
             s.openssl
             s.zlib
             s.libxml2
             sqlite
             s.oniguruma
-            readlineFB
+            s.readline
             gmp
             s.gettext
             s.libsodium
@@ -237,23 +262,29 @@
             s.libzip
             s.pcre2
             s.libiconv
+            libpq
+            s.libpng
+            s.libjpeg
+            s.libwebp
+            s.freetype
+            libavif
+            s.icu
+            s.openldap
+          ] ++ lib.optionals s.stdenv.hostPlatform.isLinux [
+            s.cyrus_sasl
           ];
 
           # Build the wrapper from the NON-static set, overriding only the
           # stdenv (-> static musl) and the generic.nix named deps that we link.
-          # Turning off the extra sapis through the *generic args* (cleaner than
-          # filtering configureFlags by string) also drops their deps: no acl
-          # (fpm), no pear install step.
+          # The sapis are chosen through the *generic args* (cleaner than
+          # filtering configureFlags by string), which also brings or drops
+          # their deps: acl for fpm, no pear install step.
           php = pkgs.php84.override {
             stdenv = engStdenv pkgs;
             pcre2 = s.pcre2;
-            # Use the psl-disabled curl as php84's named `curl` dep too, not just
-            # via the --with-curl flag below. generic.nix adds this attr as a
-            # buildInput; if it stayed `s.curl` the link line would carry the
-            # psl-enabled curl's libpsl (store-path .dat leak) alongside the
-            # curlNoPsl we point configure at. Keeping both the named dep and the
-            # flag on curlNoPsl means a single, leak-free curl on the line.
-            curl = curlNoPsl;
+            curl = s.curl;
+            # fpm's listen.acl_users (ACLs on the unix socket), as in nixpkgs.
+            acl = s.acl;
             libxml2 = s.libxml2;
             # argon2Support off: both libargon2 (password_hash Argon2) and
             # libsodium (--with-sodium) vendor the same upstream argon2 and export
@@ -282,8 +313,8 @@
             valgrindSupport = false;
           };
         in
-        # `.unwrapped` is the raw ./configure derivation (bin/php only). Layer the
-        # curated extension set on top of its `--disable-all` base.
+        # `.unwrapped` is the raw ./configure derivation. Layer the curated
+        # extension set on top of its `--disable-all` base.
         php.unwrapped.overrideAttrs (old: {
           # `--with-config-file-path` defaults to `$prefix/lib`, so `php -i`
           # reported the php.ini path as a /nix/store directory that does not
@@ -297,9 +328,6 @@
             "--with-config-file-scan-dir=/etc/php.d"
           ];
           buildInputs = (old.buildInputs or [ ]) ++ extInputs;
-          # The static stdenv has already moved generic.nix's buildInputs here.
-          propagatedBuildInputs = builtins.filter (x: (x.pname or "") != "acl")
-            (old.propagatedBuildInputs or [ ]);
 
           # PHP's fopencookie seeker test can't run under cross (pkgsStatic =
           # glibc-build -> musl-host), so configure guesses from the host triple:
@@ -359,49 +387,17 @@
           # zend_load_static_extensions() in main/main.c, and (e) makes the IR
           # gdb-jit symbols static to avoid a duplicate-symbol clash. ./buildconf
           # (in preConfigure) regenerates configure so the AC_DEFINE takes effect.
-          patches = (old.patches or [ ]) ++ [ ./static_opcache_84.patch ];
+          # Source: github.com/crazywhalecc/static-php-cli, branch v3, commit
+          # 14bfb4198a88, src/globals/patch/php-src-patches/static_opcache_84.patch
+          # (byte-identical). Drop it when nixpkgs moves `php` to 8.5, where
+          # opcache is always compiled in. The other two are ours; each says why
+          # in its header.
+          patches = (old.patches or [ ]) ++ [
+            ./static_opcache_84.patch
+            ./opcache-jit-arm64-host-alias.patch
+            ./readline-cli-static-shell-callbacks.patch
+          ];
 
-          # opcache JIT selects its IR backend by matching `$host_alias` — the RAW
-          # --host value, not the config.sub-canonicalized `$host`. nixpkgs darwin
-          # spells the arm64 triple `arm64-apple-darwin`, but config.m4 only matches
-          # `aarch64*`, so IR_TARGET comes out EMPTY and the build emits a malformed
-          # `-D -DIR_PHP` ("macro name must be an identifier"). (config.guess on a
-          # native Apple-Silicon runner yields `aarch64-apple-darwin`, so this only
-          # bites the nix arm64 spelling.) Teach the case to also accept `arm64*`.
-          # buildconf (preConfigure) regenerates configure from this config.m4.
-          postPatch = (old.postPatch or "") + ''
-            substituteInPlace ext/opcache/config.m4 \
-              --replace-fail '[aarch64*], [' '[aarch64*|arm64*], ['
-
-            # `php -a` answers "requires the readline extension" even though
-            # readline IS linked in and `php -m` lists it: the extension reaches
-            # the cli's callback table with dlsym(RTLD_DEFAULT, …), and in a
-            # static binary that lookup returns NULL, so the shell is never
-            # registered. Upstream's own commented-out alternative right below
-            # the dlsym is the direct call, but taking it plainly breaks the
-            # three standalone sapi links that happen before the multicall
-            # relink — php_cli_get_shell_callbacks lives in the cli, and a weak
-            # *reference* is an ELF idea that ld64 rejects outright. A weak
-            # *definition* works on both formats: the cli's real function
-            # overrides it wherever the cli is linked (the cli itself and the
-            # multicall), and where it is not — cgi, fpm and phpdbg, none of
-            # which has an interactive shell — the callbacks come back NULL,
-            # exactly what the dlsym used to return there.
-            substituteInPlace ext/readline/readline_cli.c \
-              --replace-fail '#include "readline_cli.h"' \
-                '#include "readline_cli.h"
-__attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) { return (cli_shell_callbacks_t *)0; }' \
-              --replace-fail 'get_callbacks = dlsym(RTLD_DEFAULT, "php_cli_get_shell_callbacks");' \
-                             'get_callbacks = php_cli_get_shell_callbacks;'
-          '';
-
-          # Static link needs every transitive dep on the line in order — but
-          # PHP's PKG_CHECK_MODULES uses plain `$PKG_CONFIG --libs`, emitting only
-          # the top-level `-lcurl`/`-lzip`/`-lxml2` and dropping each .pc's
-          # Libs.private (curl's nghttp2/3, ngtcp2, brotli, idn2, psl, ssh2, zstd,
-          # ssl…; libzip's bz2/lzma/zstd; libxml2's lzma/z). Append `--static` to
-          # the nixpkgs-exported PKG_CONFIG so every probe pulls the full private
-          # chain (with correct -L and ordering) in one shot.
           # Multicall: drop the dispatcher + the relink makefile into the tree.
           preBuild = (old.preBuild or "") + ''
             cp ${./unpin_dispatch.c} unpin_dispatch.c
@@ -443,6 +439,13 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
             rm -f "$out/share/man/man1/phar.1"* "$out/share/man/man1/phar.phar.1"*
           '';
 
+          # Static link needs every transitive dep on the line in order — but
+          # PHP's PKG_CHECK_MODULES uses plain `$PKG_CONFIG --libs`, emitting only
+          # the top-level `-lcurl`/`-lzip`/`-lxml2` and dropping each .pc's
+          # Libs.private (curl's nghttp2/3, ngtcp2, brotli, idn2, psl, ssh2, zstd,
+          # ssl…; libzip's bz2/lzma/zstd; libxml2's lzma/z). Append `--static` to
+          # the nixpkgs-exported PKG_CONFIG so every probe pulls the full private
+          # chain (with correct -L and ordering) in one shot.
           preConfigure = (old.preConfigure or "") + ''
             export PKG_CONFIG="''${PKG_CONFIG:-pkg-config} --static"
 
@@ -528,20 +531,18 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
             # local Mac builder and the Xcode layout on GHA macos-14.
             export CPPFLAGS="-idirafter $(/usr/bin/env -u DEVELOPER_DIR -u SDKROOT /usr/bin/xcrun --show-sdk-path)/usr/include ''${CPPFLAGS:-}"
           ''
-          # Engine (Linux/musl): opcache JIT's zend_jit_unwind_cb and
-          # Zend/zend_call_stack.c (HAVE_UNWIND, JIT/fiber stack-bounds probing)
-          # call _Unwind_Backtrace + _Unwind_GetCFA. gcc/musl pulled these from
-          # libgcc; the engine (compiler-rt, no libgcc) provides the _Unwind_*
-          # API only in libunwind, and its link driver adds -lunwind ONLY when it
-          # detects a C++ link (unpin_musl.cpp wantsCxx: argv0 "++", -lc++,
-          # .cpp inputs). A bare `-lc++` on the link line flips that detection,
-          # so the driver emits its `--start-group -lc++ -lc++abi -lunwind …`
-          # group. The libc++/libc++abi archives stay inert (no C++ symbol is
-          # referenced by this C binary — archive semantics link only libunwind's
-          # _Unwind_* objects), so the fold gains exactly the unwinder gcc used to
-          # supply, nothing more. LDFLAGS is baked into the Makefile's $(LDFLAGS),
-          # so the four sapi links AND unpin-multicall.mk's relink all pick it up.
+          # Engine (Linux/musl): the C++ runtime is libc++, and PHP_REQUIRE_CXX
+          # (intl) hardcodes `-lstdc++`, which no engine target has: every
+          # configure link test after intl's check then fails. generic.nix
+          # makes the same swap on darwin. `-lc++` also makes the engine's link
+          # driver (unpin_musl.cpp wantsCxx) emit its `--start-group -lc++
+          # -lc++abi -lunwind …` group, which carries the _Unwind_Backtrace /
+          # _Unwind_GetCFA that opcache's JIT and Zend/zend_call_stack.c call
+          # (libgcc supplied them under gcc). LDFLAGS is baked into the
+          # Makefile's $(LDFLAGS), so the four sapi links AND
+          # unpin-multicall.mk's relink all pick it up.
           + lib.optionalString s.stdenv.hostPlatform.isLinux ''
+            substituteInPlace configure --replace-fail "-lstdc++" "-lc++"
             export LDFLAGS="-lc++ ''${LDFLAGS:-}"
           ''
           + ''
@@ -568,32 +569,17 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
             export BUILD_CC=${pkgs.buildPackages.stdenv.cc}/bin/cc
           '';
 
-          # A few compile-time default DATA-dir paths get baked into the binary as
-          # store refs (the 0-ref gate rejects them): openssl's OPENSSLDIR
-          # (${"$"}etc/etc/ssl/certs — an *empty* dir; nixpkgs rmdir's certs/private),
-          # libxml2's default catalog (${"$"}out/etc/xml/catalog — also empty), and
-          # (darwin only) gettext's libintl default LOCALEDIR (${"$"}gettext/share/
-          # locale). None holds data the relocatable binary should pin: TLS certs
-          # come from SSL_CERT_FILE / the system store at runtime (the documented
-          # unpins precedence; full native-trust via libunpinca is the follow-up),
-          # the XML catalog is a system concern, and gettext message catalogs are
-          # selected by the script via bindtextdomain() (the baked LOCALEDIR is only
-          # a fallback). Neutralize the refs the way openssl does its own self-ref —
-          # remove-references-to rewrites the hash to a non-reference marker.
-          nativeBuildInputs = (old.nativeBuildInputs or [ ])
-            ++ [ pkgs.removeReferencesTo ];
-          # Only the real multicall binary needs scrubbing; the sapi names are
-          # symlinks to it.
           # PHP's own suite, restricted to the engine and the language tests:
           # 5600 tests in 11 seconds, all green under static musl and the
           # engine — and the first thing a codegen miscompile would take down.
-          # The extension suites stay out: 24 of their tests fail for reasons
-          # that are musl's or this build's rather than defects (gettext and
-          # iconv answer differently under musl, pathconf is unimplemented, two
-          # want an FTPS server, one wants a fork-safe pcre), and pinning 24
-          # test names would go stale at the next PHP release. run-tests.php
-          # exits non-zero on failure, so this needs no output matching; by
-          # checkPhase time sapi/cli/php is already the multicall binary.
+          # The extension suites stay out: 9 of their ~14 900 tests fail for
+          # reasons that are musl's or nixpkgs' rather than defects (musl's
+          # gettext drops the `.UTF-8` of a locale name when it looks for a
+          # catalog, pathconf is unimplemented, nixpkgs' libzip has no AES), and
+          # pinning test names would go stale at the next PHP release.
+          # run-tests.php exits non-zero on failure, so this needs no output
+          # matching; by checkPhase time sapi/cli/php is already the multicall
+          # binary.
           doCheck = pkgs.pkgsStatic.stdenv.buildPlatform.canExecute
             pkgs.pkgsStatic.stdenv.hostPlatform;
           # weakmap_weakness.phpt used to be deleted here on i686, where it
@@ -606,13 +592,6 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
             TEST_PHP_EXECUTABLE="$PWD/sapi/cli/php" NO_INTERACTION=1 SKIP_PERF_SENSITIVE=1 \
               "$PWD/sapi/cli/php" run-tests.php -q -j"''${NIX_BUILD_CORES:-4}" Zend tests
             runHook postCheck
-          '';
-          postFixup = (old.postFixup or "") + ''
-            remove-references-to \
-              -t ${lib.getOutput "etc" s.openssl} \
-              -t ${lib.getLib s.libxml2} \
-              -t ${lib.getOutput "out" s.gettext} \
-              "$out/bin/php"
           '';
         }
         # darwin: php's configure-generated `libtool` used to misdetect GNU ld —
@@ -644,18 +623,12 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
     ulib.mkStandaloneFlake {
       inherit self;
       name = "php";
-      # unpin-llvm engine. All targets green: Linux (x86_64/i686/ppc64le/riscv64/
-      # aarch64/armv7l) + Windows + darwin. The set-wide engine swap surfaced a
-      # tail of darwin-engine gaps, all resolved darwin-gated (linux byte-
-      # identical): gmp CC_FOR_BUILD + --disable-fat/assembly; sqlite autosetup
-      # CC_FOR_BUILD; the trimmed apple-sdk's missing resolver headers (-idirafter
-      # host SDK); the libtool GNU-ld misdetection that baked ELF `--export-dynamic`/
-      # `--rpath` into the sapi links (postConfigure resets the C-tag flag-specs to
-      # their native-darwin empty values — see below); and the resolver link — use
-      # nixpkgs' STATIC libresolv.a (symbols embedded, no dylib load command) so the
-      # binary stays inside the darwin portability allow-list, matching how the
-      # pre-engine full-SDK build linked it (see the darwin LDFLAGS above).
+      # The darwin-engine gaps are each handled darwin-gated above (Linux stays
+      # untouched): gmp's CC_FOR_BUILD and --disable-fat/assembly, sqlite's
+      # CC_FOR_BUILD, the resolver headers and the static libresolv.a, and the
+      # postConfigure assert against libtool's GNU-ld specs.
       engine = "unpin-llvm";
+      dnsFallback = true; # resolves hostnames; opt into the Android DNS fallback
       # php folds its own sapis on BOTH halves (unpin-multicall.mk natively,
       # windows.nix for the `.exe`), so nix-lib emits no bitcode module; the
       # block is here to put the `.exe` on the engine too, instead of the
@@ -683,9 +656,8 @@ __attribute__((weak)) cli_shell_callbacks_t *php_cli_get_shell_callbacks(void) {
       # even exist, and the ini path is already /etc. The `.exe` had two of its
       # own — gettext's locale root and curl's public-suffix list, both paths
       # that exist on no Windows machine — dragging a 113 MB closure behind a
-      # 26 MB binary. (postFixup scrubs the same two on the native side, where
-      # it can name the store paths directly; this is the only lever the
-      # windowsBuild path has.)
+      # 26 MB binary. The native binary carries the same two dead paths
+      # (gettext's only on darwin).
       removeReferences = [ "php-static" "php-windows" "gettext" "publicsuffix" ];
       smoke = [ "-r" "echo 'php ' . (6 * 7);" ];
       smokePattern = "php 42";

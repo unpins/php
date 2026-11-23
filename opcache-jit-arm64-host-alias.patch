@@ -1,0 +1,22 @@
+Let the JIT pick its aarch64 backend for nixpkgs' arm64 triple.
+
+opcache's JIT selects its IR backend by matching `$host_alias`, the RAW
+--host value, not the config.sub-canonicalized `$host`. nixpkgs darwin
+spells the arm64 triple `arm64-apple-darwin`, but config.m4 only matches
+`aarch64*`, so IR_TARGET comes out EMPTY and the build emits a malformed
+`-D -DIR_PHP` ("macro name must be an identifier"). (config.guess on a
+native Apple-Silicon runner yields `aarch64-apple-darwin`, so this only
+bites the nix arm64 spelling.) Accept `arm64*` too. buildconf regenerates
+configure from this config.m4.
+
+--- a/ext/opcache/config.m4
++++ b/ext/opcache/config.m4
+@@ -83,7 +83,7 @@
+         IR_TARGET=IR_TARGET_X86
+         DASM_ARCH="x86"
+       ],
+-      [aarch64*], [
++      [aarch64*|arm64*], [
+         IR_TARGET=IR_TARGET_AARCH64
+         DASM_ARCH="aarch64"
+       ])

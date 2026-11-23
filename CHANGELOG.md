@@ -2,15 +2,38 @@
 
 ## [Unreleased]
 
+### Added
+
+- Every extension nixpkgs enables by default is now built in: `mysqli` and
+  `pdo_mysql` (through PHP's own MySQL client), `pgsql` and `pdo_pgsql`, `gd`
+  (PNG, JPEG, WebP, AVIF, BMP and GIF, FreeType text, Japanese fonts), `intl`,
+  `ldap`, `shmop` and the System V ones (`sysvmsg`, `sysvsem`, `sysvshm`).
+  The one left out on Linux and macOS is `pdo_odbc`: unixODBC loads each
+  database driver as a shared library at run time. The Windows binary has it,
+  through Windows' own ODBC driver manager, and has all the others except the
+  POSIX-only `pcntl`, `posix` and System V ones; its `ldap` binds with a
+  password only, without SASL. `intl` carries ICU's locale data, so the
+  binaries grow to about 83 MB.
+- `php-fpm` honours `listen.acl_users` / `listen.acl_groups` (ACLs on its
+  unix socket), as nixpkgs' php does.
+- curl checks cookie domains against the Public Suffix List, as nixpkgs'
+  curl does.
+
 ### Fixed
 
+- `php -a` started no interactive shell: it answered "Interactive shell
+  requires the readline extension" although readline is built in.
+- Hostname lookups (`gethostbyname`, `fsockopen`, …) work on systems without
+  `/etc/resolv.conf`, such as Android.
+- The macOS binaries listed the Nix store directories of their build
+  libraries as library search paths. Nothing was loaded from them, but
+  `nix build` on a Mac fetched the whole build toolchain along with php.
 - The Windows binary had only 21 of the extensions the Linux and macOS ones
-  have. It now has the same set except `pcntl` and `posix`, which are
-  POSIX-only: `bcmath`, `calendar`, `ctype`, `dom` (with the HTML5 parser),
+  have. Besides the ones added above, it now has `bcmath`, `calendar`, `ctype`, `dom` (with the HTML5 parser),
   `exif`, `fileinfo`, `filter`, `ftp`, `libxml`, `Phar`, `readline` (so
   `php -a` edits lines and keeps history), `session`, `SimpleXML`, `soap`,
   `sockets`, `tokenizer`, `xml`, `xmlreader`, `xmlwriter`, `zlib`, and OPcache
-  with the JIT. The binary grows from 18.4 MB to 32.3 MB.
+  with the JIT.
 
 ## [8.4.25-1] - 2026-09-26
 

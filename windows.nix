@@ -8,7 +8,7 @@
 # (configure.js → config.w32.h → nmake) and is NEVER reached by PHP's autotools
 # configure, which compiles the POSIX paths (fork/dlopen/...) that mingw can't
 # provide. nixpkgs has no Windows PHP. So we bootstrap config.w32.h by hand and
-# compile the win32 path with mingw-gcc: de-MSVC-ify the `#ifdef ZEND_WIN32`
+# compile the win32 path with the engine's mingw clang: de-MSVC-ify the `#ifdef ZEND_WIN32`
 # blocks (gate on _MSC_VER so mingw takes the __GNUC__ path), zero the
 # __declspec(dll*) API macros (single static binary, no DLL boundary), and
 # supply the few generated files configure.js would have (internal_functions.c,
@@ -22,7 +22,7 @@ let
   # carried live references to `openssl-…-w64-mingw32` and its `-etc` -- two
   # store paths that exist on no user's machine. This is closure hygiene, not a
   # TLS fix: that OPENSSLDIR is an empty directory even inside the store, and
-  # PHP resolves CAs through openssl.cafile / SSL_CERT_FILE / the system store,
+  # PHP takes its CAs from openssl.cafile / openssl.capath / SSL_CERT_FILE,
   # so nothing resolved differently before. The retarget is set-wide ONLY in the
   # engine's native scope (nix-lib/native-overlay/openssl.nix); the mingw scope
   # has none -- openssl/flake.nix:57 retargets the openssl PACKAGE's own .exe,
@@ -32,10 +32,104 @@ let
     # readline's terminal.c and termcap both define the global `PC` (and
     # BC/UP); as a common symbol readline's copy yields to termcap's instead
     # of colliding in the static link.
+    # ICU's tools link against -licuuc, but a static mingw build names its
+    # archives libsicu*.a, so they cannot link; intl needs only the libraries.
+    icu = prev.icu.overrideAttrs (o: {
+      configureFlags = o.configureFlags ++ [
+        "--disable-tools" "--disable-extras" "--disable-tests" "--disable-samples"
+      ];
+      # On Windows pkgdata installs the data archive into bindir, which no
+      # tool creates any more.
+      preInstall = (o.preInstall or "") + ''
+        mkdir -p "$dev/bin"
+      '';
+    });
+    # OpenLDAP's client libraries (libldap, liblber) for the ldap ext; upstream
+    # supports MinGW, nixpkgs does not list Windows. No slapd, no tools, no
+    # SASL (nixpkgs has no cyrus-sasl for Windows); TLS through OpenSSL.
+    openldap = (prev.openldap.override { libxcrypt = null; }).overrideAttrs (o: {
+      buildInputs = [ final.openssl ];
+      configureFlags = [
+        "--disable-slapd" "--without-cyrus-sasl" "--with-tls=openssl"
+        "--with-yielding_select=yes" "ac_cv_func_memcmp_working=yes"
+        # configure demands POSIX regex for the whole tree, but only slapd and
+        # librewrite (not built) use it; libldap and liblber never include regex.h.
+        "ac_cv_header_regex_h=yes" "ac_cv_search_regfree=-lmingwex"
+        "ol_cv_c_posix_regex=yes"
+        # With ws2_32 already in LIBS the winsock probe answers "none", which
+        # leaves HAVE_WINSOCK2 (winsock2.h, getaddrinfo, IPv6) undefined.
+        "ol_cv_winsock=yes"
+      ];
+      # A static OpenSSL needs the Windows system libraries at configure's
+      # link test.
+      env = { LIBS = "-lws2_32 -lcrypt32 -lbcrypt -lgdi32"; };
+      extraContribModules = [ ];
+      buildPhase = ''
+        runHook preBuild
+        # Only the client libraries: librewrite (slapd's) needs POSIX regex.
+        make ''${makeFlags[@]} -C include
+        for d in liblutil liblber libldap; do make ''${makeFlags[@]} -C libraries/$d; done
+        runHook postBuild
+      '';
+      postBuild = "";
+      doCheck = false;
+      installPhase = ''
+        runHook preInstall
+        make ''${installFlags[@]} -C include install
+        for d in liblber libldap; do make ''${installFlags[@]} -C libraries/$d install; done
+        runHook postInstall
+      '';
+      postInstall = "";
+      preFixup = "";
+      outputs = [ "out" "dev" ];
+      meta = o.meta // { platforms = o.meta.platforms ++ [ "x86_64-windows" ]; };
+    });
+    # gd's AVIF: libavif with aom (encode) and dav1d (decode), through
+    # nix-lib's static fixes, as the avif package builds it.
+    libyuv = ulib.nativeFixes.libyuv prev;
+    libavif = ulib.nativeFixes.libavif prev;
     readline = prev.readline.overrideAttrs (o: {
       env = (o.env or { }) // {
         NIX_CFLAGS_COMPILE = toString ((o.env.NIX_CFLAGS_COMPILE or "") + " -fcommon");
       };
+    });
+    # libpq: nixpkgs lists PostgreSQL's platforms without Windows, but the
+    # client library builds under mingw (upstream supports it). Its curl
+    # (OAuth) is off, as in nixpkgs' static builds, and makeWrapper goes: it
+    # only serves pg_config and would pull a Windows bash. A static OpenSSL
+    # needs the Windows system libraries at configure's link test.
+    libpq = (prev.libpq.override { curlSupport = false; }).overrideAttrs (o: {
+      nativeBuildInputs = builtins.filter
+        (d: (d.name or "") != "make-shell-wrapper-hook") o.nativeBuildInputs;
+      env = o.env // { LIBS = "-lcrypt32 -lws2_32 -lsecur32"; };
+      # libpq brings its own pthread-win32.c: six pthread_* functions over its
+      # own pthread_mutex_t (a CRITICAL_SECTION wrapper), which collide in the
+      # link with mingw's winpthreads, whose types differ. Inside libpq they
+      # take a pq_ prefix, so each side keeps its own ABI.
+      postPatch = (o.postPatch or "") + ''
+        cat >> src/interfaces/libpq/Makefile <<'EOF'
+        override CPPFLAGS += $(foreach f,self setspecific getspecific mutex_init mutex_lock mutex_unlock,-Dpthread_$(f)=pq_pthread_$(f))
+        EOF
+      '';
+      # libpgcommon's exec.o is for PostgreSQL's own programs: it sets
+      # `_CRT_glob = 0` (no argv wildcard expansion), and the mingw startup
+      # references that symbol, so the archive member would land in php.exe,
+      # change its argv, and bring a `_popen`/`_pclose` import that collides
+      # with TSRM's own. libpq uses nothing in it.
+      #
+      # On win32, Makefile.shlib always builds libpq.dll and names its import
+      # library `libpq.a`, --disable-shared or not: php.exe would then need
+      # LIBPQ.dll beside it. The real archive is assembled from the same
+      # objects, with the static-only OAuth stub instead of the DLL's.
+      postInstall = (o.postInstall or "") + "\n" + ''
+        ar=${ulib.llvmMultitool pkgs.stdenv.buildPlatform.system}
+        $ar llvm-ar d "$dev/lib/libpgcommon.a" exec.o
+        make -C src/interfaces/libpq fe-auth-oauth.o
+        rm "$dev/lib/libpq.a"
+        objs=$(ls src/interfaces/libpq/*.o | grep -v -e '_shlib\.o$' -e '/win32ver\.o$')
+        $ar llvm-ar rcs "$dev/lib/libpq.a" $objs
+      '';
+      meta = o.meta // { platforms = o.meta.platforms ++ [ "x86_64-windows" ]; };
     });
   });
   stdenv = S.stdenv;
@@ -66,12 +160,20 @@ let
     (allowWin S.oniguruma) (allowWin S.libzip) curlSchannel
     S.pcre2 S.zlib S.nghttp2 S.libidn2 S.libpsl S.zstd S.brotli S.libunistring
     S.libxml2 S.readline S.termcap
+    S.libpng S.libjpeg S.libwebp S.freetype S.openldap
+    S.libavif S.libaom S.dav1d S.libyuv S.libvmaf
   ];
-  incDirs = builtins.concatStringsSep " " (map (p: "-I${lib.getDev p}/include") depOut);
+  incDirs = builtins.concatStringsSep " " (map (p: "-I${lib.getDev p}/include") (depOut ++ [ S.libpq S.icu ]));
   # .a archives live in the `out`/`lib` output — curl/openssl/sqlite default to
   # `bin`, so resolve via getLib, NOT the package's default output.
   libSearch = builtins.concatStringsSep " "
-    (map (p: "${lib.getLib p}/lib") (depOut ++ [ S.xz ]));
+    (map (p: "${lib.getLib p}/lib") (depOut ++ [ S.xz ]) ++ [
+      # libpq installs its archives (libpq, libpgcommon, libpgport) in `dev`.
+      "${lib.getDev S.libpq}/lib"
+      # ICU's `out` holds a stub data archive (libsicudt.a, no locale data);
+      # `static` holds the real one (sicudt.a) beside the libraries.
+      "${S.icu.static}/lib"
+    ]);
 
   multicall = stdenv.mkDerivation {
     pname = "php-windows";
@@ -83,7 +185,7 @@ let
     # startup when HAVE_OPCACHE is defined and COMPILE_DL_OPCACHE is not.
     patches = [ ./static_opcache_84.patch ];
     dontConfigure = true;
-    # We compile with the bare cross gcc and explicit -I/-L (the proven probe
+    # We compile with the bare engine cc and explicit -I/-L (the proven probe
     # recipe), so the stdenv wrapper's auto-CFLAGS don't apply to our objects.
     # We deliberately do NOT set dontStrip: the mkStandaloneFlake pipeline
     # (strippedOrJoined → stripAllList=[bin out]) must run the mingw strip in
@@ -145,6 +247,49 @@ let
       #define HAVE_LIBREADLINE 1
       #define HAVE_RL_COMPLETION_MATCHES 1
       #define HAVE_HISTORY_LIST 1
+      #define MYSQLND_COMPRESSION_ENABLED 1
+      #define MYSQLND_SSL_SUPPORTED 1
+      #define MYSQLND_HAVE_SSL 1
+      #define PDO_USE_MYSQLND 1
+      #define HAVE_SHMOP 1
+      #define HAVE_PGSQL 1
+      #define HAVE_PDO_PGSQL 1
+      #define HAVE_PG_RESULT_MEMORY_SIZE 1
+      #define HAVE_PG_CHANGE_PASSWORD 1
+      #define HAVE_PG_SOCKET_POLL 1
+      #define HAVE_PG_SET_CHUNKED_ROWS_SIZE 1
+      #define HAVE_PQERRORS_SQLSTATE 1
+      #define HAVE_PQCLOSEPREPARED 1
+      #define HAVE_SQL_H 1
+      #define HAVE_LDAP 1
+      #define HAVE_LDAP_PARSE_RESULT 1
+      #define HAVE_LDAP_PARSE_REFERENCE 1
+      #define HAVE_LDAP_START_TLS_S 1
+      #define HAVE_LDAP_CONTROL_FIND 1
+      #define HAVE_LDAP_PARSE_EXTENDED_RESULT 1
+      #define HAVE_LDAP_EXTENDED_OPERATION_S 1
+      #define HAVE_LDAP_PASSWD 1
+      #define HAVE_LDAP_WHOAMI_S 1
+      #define HAVE_LDAP_REFRESH_S 1
+      #define HAVE_LDAP_EXTENDED_OPERATION 1
+      #define HAVE_SQLEXT_H 1
+      #define HAVE_GD_BUNDLED 1
+      #define HAVE_GD_PNG 1
+      #define HAVE_GD_BMP 1
+      #define HAVE_GD_TGA 1
+      #define HAVE_GD_JPG 1
+      #define HAVE_GD_WEBP 1
+      #define HAVE_GD_FREETYPE 1
+      #define USE_GD_JISX0208 1
+      #define HAVE_LIBAVIF 1
+      #define HAVE_GD_AVIF 1
+      #define JISX0208 1
+      #define HAVE_LIBPNG 1
+      #define HAVE_LIBJPEG 1
+      #define HAVE_LIBWEBP 1
+      #define HAVE_LIBFREETYPE 1
+      /* mysqlnd_portability.h's PHP_WIN32 default is MSVC's `i64` suffix. */
+      #define L64(x) x##LL
       EOF
       # config.w32.h.in additions above are indented by the Nix heredoc; strip
       # the leading whitespace so the #defines are valid preprocessor lines.
@@ -181,11 +326,11 @@ let
       # _MSC_VER so mingw keeps plain execute_ex (its CALL VM saves XMM normally).
       sed -i 's/#if defined(_WIN64) \&\& defined(_M_X64)$/#if defined(_WIN64) \&\& defined(_M_X64) \&\& defined(_MSC_VER)/' Zend/zend_vm_execute.h
       # header case (mingw-on-linux is case-sensitive; PHP uses CamelCase names).
-      grep -rlE 'Ws2tcpip\.h|Winsock2\.h|Windows\.h|Mmsystem\.h|Wincrypt\.h|Mswsock\.h|Shlwapi\.h|Winuser\.h|Sddl\.h|WinBase\.h|Winbase\.h|Windns\.h|IPHlpApi\.h' main Zend TSRM win32 ext sapi 2>/dev/null \
-        | xargs -r sed -i 's/Ws2tcpip\.h/ws2tcpip.h/g; s/Winsock2\.h/winsock2.h/g; s/Windows\.h/windows.h/g; s/Mmsystem\.h/mmsystem.h/g; s/Wincrypt\.h/wincrypt.h/g; s/Mswsock\.h/mswsock.h/g; s/Shlwapi\.h/shlwapi.h/g; s/Winuser\.h/winuser.h/g; s/Sddl\.h/sddl.h/g; s/WinBase\.h/winbase.h/g; s/Winbase\.h/winbase.h/g; s/Windns\.h/windns.h/g; s/IPHlpApi\.h/iphlpapi.h/g'
+      grep -rlE 'Ws2tcpip\.h|Winsock2\.h|Windows\.h|Mmsystem\.h|Wincrypt\.h|Mswsock\.h|Shlwapi\.h|Winuser\.h|Sddl\.h|WinBase\.h|Winbase\.h|Windns\.h|IPHlpApi\.h|Wingdi\.h' main Zend TSRM win32 ext sapi 2>/dev/null \
+        | xargs -r sed -i 's/Ws2tcpip\.h/ws2tcpip.h/g; s/Winsock2\.h/winsock2.h/g; s/Windows\.h/windows.h/g; s/Mmsystem\.h/mmsystem.h/g; s/Wincrypt\.h/wincrypt.h/g; s/Mswsock\.h/mswsock.h/g; s/Shlwapi\.h/shlwapi.h/g; s/Winuser\.h/winuser.h/g; s/Sddl\.h/sddl.h/g; s/WinBase\.h/winbase.h/g; s/Winbase\.h/winbase.h/g; s/Windns\.h/windns.h/g; s/IPHlpApi\.h/iphlpapi.h/g; s/Wingdi\.h/wingdi.h/g'
       sed -i 's@\.h >@.h>@g' ext/standard/dns_win32.c
       # phpdbg wraps main() in MSVC SEH (__try/__except) for a crash backtrace —
-      # mingw-gcc has no __try. The two are the only bare `#ifdef _WIN32` in the
+      # a mingw target has no __try. The two are the only bare `#ifdef _WIN32` in the
       # file; gate them on _MSC_VER so both brace-halves vanish together for mingw.
       sed -i 's/^#ifdef _WIN32$/#ifdef _MSC_VER/' sapi/phpdbg/phpdbg.c
       # ext/sockets expects the Windows SDK's ws2def.h, which spells the
@@ -238,6 +383,7 @@ let
     buildPhase = ''
       runHook preBuild
       CC=$(echo ${stdenv.cc}/bin/*-gcc)
+      CXX=$(echo ${stdenv.cc}/bin/*-g++)
       # The engine compiles every object to bitcode, which the binutils nm and
       # objcopy do not read. `llvm nm` does, and a symbol rename that objcopy
       # would write into a COFF symtab is a rename in the IR instead.
@@ -258,11 +404,11 @@ let
         rm -f "$o.ll"
       }
       EXTINC="-Iext/mbstring -Iext/mbstring/libmbfl -Iext/mbstring/libmbfl/mbfl ${incDirs}"
-      INC="-I. -Imain -IZend -ITSRM -Imain/streams -Iext/date/lib -Iext/hash/sha3/generic64lc -I${lib.getDev S.pcre2}/include $EXTINC -Iopenssl-applink-stub -Isapi/cgi -Isapi/phpdbg -I${lib.getDev S.libxml2}/include/libxml2 -Iext/dom/lexbor"
+      INC="-I. -Imain -IZend -ITSRM -Imain/streams -Iext/date/lib -Iext/hash/sha3/generic64lc -I${lib.getDev S.pcre2}/include $EXTINC -Iopenssl-applink-stub -Isapi/cgi -Isapi/phpdbg -I${lib.getDev S.libxml2}/include/libxml2 -Iext/dom/lexbor -Iext/gd/libgd -I${lib.getDev S.freetype}/include/freetype2"
       DEF="-include time.h -DPHP_WIN32=1 -DZEND_WIN32=1 -DPHP_EXPORTS=1 -DLIBZEND_EXPORTS=1 -DCWD_EXPORTS=1 -DTSRM_EXPORTS=1 -DSAPI_EXPORTS=1 -D_WIN32_WINNT=0x0602 -DWIN32 -D_USE_MATH_DEFINES -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 -DPCRE2_CODE_UNIT_WIDTH=8 -DPCRE2_STATIC=1 -DKeccakP200_excluded -DKeccakP400_excluded -DKeccakP800_excluded -Wno-error=format-security -Wno-format-security -Wno-error=incompatible-pointer-types"
-      EXTDEF="-DCURL_STATICLIB -DPHP_CURL_EXPORTS=1 -DSODIUM_STATIC=1 -DZIP_STATIC=1 -DLZMA_API_STATIC -DHAVE_SET_MTIME -DHAVE_ENCRYPTION -DHAVE_LIBZIP_VERSION -DHAVE_PROGRESS_CALLBACK -DHAVE_CANCEL_CALLBACK -DHAVE_METHOD_SUPPORTED -DHAVE_STRICMP -DMBFL_DLL_EXPORT=1 -DONIG_EXTERN=extern -DPHP_ONIG_BAD_KOI8_ENTRY=1 -DONIG_STATIC=1 -DPHP_ICONV_EXPORTS -DPHP_ICONV_IMPL=\"libiconv\" -DLIBXML_STATIC -DLEXBOR_STATIC -DPHP_SOCKETS_EXPORTS=1"
-      mkdir -p obj; fail=0
-      EXCL="sapi/cli/cli_win32.c Zend/Optimizer/ssa_integrity.c win32/cp_enc_map.c win32/cp_enc_map_gen.c win32/dllmain.c main/php_odbc_utils.c main/debug_gdb_scripts.c Zend/zend_gdb.c ext/standard/crc32_x86.c"
+      EXTDEF="-DCURL_STATICLIB -DPHP_CURL_EXPORTS=1 -DSODIUM_STATIC=1 -DZIP_STATIC=1 -DLZMA_API_STATIC -DHAVE_SET_MTIME -DHAVE_ENCRYPTION -DHAVE_LIBZIP_VERSION -DHAVE_PROGRESS_CALLBACK -DHAVE_CANCEL_CALLBACK -DHAVE_METHOD_SUPPORTED -DHAVE_STRICMP -DMBFL_DLL_EXPORT=1 -DONIG_EXTERN=extern -DPHP_ONIG_BAD_KOI8_ENTRY=1 -DONIG_STATIC=1 -DPHP_ICONV_EXPORTS -DPHP_ICONV_IMPL=\"libiconv\" -DLIBXML_STATIC -DLEXBOR_STATIC -DPHP_SOCKETS_EXPORTS=1 -DPGSQL_EXPORTS=1 -DPHP_GD_EXPORTS=1 -DHAVE_GD_GET_INTERPOLATION"
+      mkdir -p obj
+      EXCL="sapi/cli/cli_win32.c Zend/Optimizer/ssa_integrity.c win32/cp_enc_map.c win32/cp_enc_map_gen.c win32/dllmain.c main/debug_gdb_scripts.c Zend/zend_gdb.c ext/standard/crc32_x86.c"
       CORE_SRCS="win32/*.c main/*.c main/streams/*.c Zend/*.c Zend/Optimizer/*.c TSRM/*.c \
             ext/date/*.c ext/date/lib/*.c ext/pcre/*.c ext/hash/*.c \
             ext/hash/sha3/generic64lc/KeccakHash.c ext/hash/sha3/generic64lc/KeccakSponge.c ext/hash/sha3/generic64lc/KeccakP-1600-opt64.c \
@@ -290,11 +436,14 @@ let
               for f in $files; do printf '%s/%s\n' "$dir" "$f"; done
             done
       }
-      W32_EXTS="ctype tokenizer session filter bcmath calendar phar zlib exif ftp sockets libxml dom xml simplexml xmlreader xmlwriter soap readline"
-      EXT_SRCS=$(for e in $W32_EXTS; do w32srcs $e; done)
+      W32_EXTS="ctype tokenizer session filter bcmath calendar phar zlib exif ftp sockets libxml dom xml simplexml xmlreader xmlwriter soap readline pdo_mysql shmop pgsql pdo_pgsql gd pdo_odbc ldap"
+      # gd's list carries gd2copypal.c, a stand-alone tool with its own main().
+      EXT_SRCS=$(for e in $W32_EXTS; do w32srcs $e; done | grep -v '/gd2copypal\.c$')
       [ "$(echo "$EXT_SRCS" | wc -l)" -gt 250 ] || { echo "w32srcs found too few sources" >&2; exit 1; }
       # fileinfo names its libmagic sources through a variable.
       FILEINFO_SRCS="ext/fileinfo/fileinfo.c ext/fileinfo/php_libmagic.c $(ls ext/fileinfo/libmagic/*.c)"
+      # So do mysqlnd and mysqli: every .c of each directory.
+      MYSQL_SRCS="$(ls ext/mysqlnd/*.c ext/mysqli/*.c)"
       CLI_SRCS="sapi/cli/php_cli.c sapi/cli/php_cli_server.c sapi/cli/ps_title.c sapi/cli/php_http_parser.c sapi/cli/php_cli_process_title.c"
       CGI_SRCS="sapi/cgi/cgi_main.c"
       PHPDBG_SRCS="sapi/phpdbg/phpdbg.c sapi/phpdbg/phpdbg_prompt.c sapi/phpdbg/phpdbg_cmd.c sapi/phpdbg/phpdbg_info.c sapi/phpdbg/phpdbg_help.c sapi/phpdbg/phpdbg_break.c sapi/phpdbg/phpdbg_print.c sapi/phpdbg/phpdbg_bp.c sapi/phpdbg/phpdbg_list.c sapi/phpdbg/phpdbg_utils.c sapi/phpdbg/phpdbg_set.c sapi/phpdbg/phpdbg_frame.c sapi/phpdbg/phpdbg_watch.c sapi/phpdbg/phpdbg_win.c sapi/phpdbg/phpdbg_btree.c sapi/phpdbg/phpdbg_parser.c sapi/phpdbg/phpdbg_lexer.c sapi/phpdbg/phpdbg_sigsafe.c sapi/phpdbg/phpdbg_io.c sapi/phpdbg/phpdbg_out.c"
@@ -308,7 +457,8 @@ let
         case " $EXCL " in *" $srcfile "*) return 0;; esac
         case "$srcfile" in *hash_sha_ni.c) extra="$extra -msha -mssse3 -msse4.2";; esac
         o="obj/$(echo $srcfile|tr / _).o"
-        if ! $CC $DEF $EXTDEF $INC $extra -c "$srcfile" -o "$o" 2>"$o.err"; then
+        cc=$CC; case "$srcfile" in *.cpp) cc="$CXX -std=c++17";; esac
+        if ! $cc $DEF $EXTDEF $INC $extra -c "$srcfile" -o "$o" 2>"$o.err"; then
           : > "fails/$(echo $srcfile|tr / _)"
           echo "FAIL $srcfile"; grep -iE "error:|fatal error:" "$o.err" | head -2
         fi
@@ -325,8 +475,12 @@ let
         done
         wait
       }
-      compile_all "" $CORE_SRCS $CLI_SRCS $CGI_SRCS $EXT_SRCS
+      compile_all "" $CORE_SRCS $CLI_SRCS $CGI_SRCS $EXT_SRCS $MYSQL_SRCS
       compile_all "-Iext/fileinfo/libmagic -Iext/fileinfo" $FILEINFO_SRCS
+      # intl: every source under ext/intl, as its config.w32 lists them, with
+      # its flags; U_STATIC_IMPLEMENTATION because ICU is linked in.
+      compile_all "-Iext/intl -DU_STATIC_IMPLEMENTATION -DUNISTR_FROM_CHAR_EXPLICIT=explicit -DUNISTR_FROM_STRING_EXPLICIT=explicit -DU_NO_DEFAULT_INCLUDE_UTF_HEADERS=1 -DU_HIDE_OBSOLETE_UTF_OLD_H=1" \
+        $(find ext/intl \( -name '*.c' -o -name '*.cpp' \) -not -path '*/tests/*')
 
       # OPcache + JIT: sources and the two generated JIT headers as in
       # ext/opcache/config.w32 and jit/Makefile.frag.w32, the generators built
@@ -374,9 +528,10 @@ let
       $CC $DEF $INC -c unpin_dispatch_win.c -o obj/unpin_dispatch_win.o
 
       # ---- link the single multicall php.exe ----
-      WINLIBS="-lws2_32 -lwinmm -lshlwapi -lpsapi -ladvapi32 -luser32 -lkernel32 -lole32 -loleaut32 -lbcrypt -lcrypt32 -lwldap32 -lnetapi32 -liphlpapi -ldnsapi -lsecur32 -lnormaliz -lgdi32"
-      ALLA=$(find ${libSearch} -name '*.a' 2>/dev/null | tr '\n' ' ')
-      $CC obj/*.o -Wl,--start-group $ALLA -Wl,--end-group $WINLIBS -o php.exe
+      WINLIBS="-lws2_32 -lwinmm -lshlwapi -lpsapi -ladvapi32 -luser32 -lkernel32 -lole32 -loleaut32 -lbcrypt -lcrypt32 -lwldap32 -lnetapi32 -liphlpapi -ldnsapi -lsecur32 -lnormaliz -lgdi32 -lodbc32 -lodbccp32"
+      ALLA=$(find ${libSearch} -name '*.a' | tr '\n' ' ')
+      # The C++ driver, for intl's C++ runtime.
+      $CXX obj/*.o -Wl,--start-group $ALLA -Wl,--end-group $WINLIBS -o php.exe
       runHook postBuild
     '';
 

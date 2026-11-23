@@ -56,6 +56,16 @@ extern zend_module_entry xmlreader_module_entry;
 extern zend_module_entry xmlwriter_module_entry;
 extern zend_module_entry soap_module_entry;
 extern zend_module_entry readline_module_entry;
+extern zend_module_entry mysqlnd_module_entry;
+extern zend_module_entry mysqli_module_entry;
+extern zend_module_entry pgsql_module_entry;
+extern zend_module_entry pdo_pgsql_module_entry;
+extern zend_module_entry gd_module_entry;
+extern zend_module_entry pdo_odbc_module_entry;
+extern zend_module_entry intl_module_entry;
+extern zend_module_entry ldap_module_entry;
+extern zend_module_entry pdo_mysql_module_entry;
+extern zend_module_entry shmop_module_entry;
 
 static zend_module_entry *php_builtin_extensions[] = {
 	phpext_date_ptr, phpext_pcre_ptr, phpext_hash_ptr, phpext_json_ptr,
@@ -70,7 +80,10 @@ static zend_module_entry *php_builtin_extensions[] = {
 	&fileinfo_module_entry, &php_ftp_module_entry, &sockets_module_entry,
 	phpext_libxml_ptr, &dom_module_entry, phpext_xml_ptr,
 	&simplexml_module_entry, &xmlreader_module_entry, &xmlwriter_module_entry,
-	&soap_module_entry, &readline_module_entry
+	&soap_module_entry, &readline_module_entry, &mysqlnd_module_entry,
+	&mysqli_module_entry, &pdo_mysql_module_entry, &shmop_module_entry,
+	&pgsql_module_entry, &pdo_pgsql_module_entry, &gd_module_entry,
+	&pdo_odbc_module_entry, &intl_module_entry, &ldap_module_entry
 };
 
 #define EXTCOUNT (sizeof(php_builtin_extensions) / sizeof(zend_module_entry *))
