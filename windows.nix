@@ -161,6 +161,8 @@ let
     S.pcre2 S.zlib S.nghttp2 S.libidn2 S.libpsl S.zstd S.brotli S.libunistring
     S.libxml2 S.readline S.termcap
     S.libpng S.libjpeg S.libwebp S.freetype S.openldap
+    # freetype links harfbuzz, which links graphite2 and glib (libffi).
+    S.harfbuzz S.graphite2 S.glib S.libffi
     S.libavif S.libaom S.dav1d S.libyuv S.libvmaf
   ];
   incDirs = builtins.concatStringsSep " " (map (p: "-I${lib.getDev p}/include") (depOut ++ [ S.libpq S.icu ]));

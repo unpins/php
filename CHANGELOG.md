@@ -34,6 +34,10 @@
   `php -a` edits lines and keeps history), `session`, `SimpleXML`, `soap`,
   `sockets`, `tokenizer`, `xml`, `xmlreader`, `xmlwriter`, `zlib`, and OPcache
   with the JIT.
+- `gd`'s FreeType no longer looks for a HarfBuzz shared library at run time.
+  It used one, when the system had it, to hint glyphs such as small caps and
+  superscripts; that HarfBuzz is now built into the binary, so text drawn
+  with `imagettftext()` no longer depends on what the system has installed.
 
 ## [8.4.25-1] - 2026-09-26
 

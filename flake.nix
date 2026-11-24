@@ -494,7 +494,11 @@
             # static archive here. (An earlier engine attempt linked the host SDK's
             # libresolv.tbd — a DYLIB stub — which added a `/usr/lib/libresolv.9.dylib`
             # load command the allow-list rejects; the static .a is the fix.)
-            export LDFLAGS="-framework CoreFoundation -framework CoreServices -framework SystemConfiguration -L${s.darwin.libresolv}/lib -lresolv -L${iconvCompat}/lib -liconvcompat -L${lib.getLib s.libiconvReal}/lib -liconv ''${LDFLAGS:-}"
+            # freetype links harfbuzz (CoreText) and glib (Foundation, AppKit):
+            # the same dropped tokens, so take them from its .pc.
+            ftFrameworks=$(''${PKG_CONFIG:-pkg-config} --libs freetype2 | grep -o -- '-framework [A-Za-z]*' | sort -u | tr '\n' ' ')
+            [ -n "$ftFrameworks" ] || { echo "freetype2.pc lists no frameworks" >&2; exit 1; }
+            export LDFLAGS="-framework CoreFoundation -framework CoreServices -framework SystemConfiguration $ftFrameworks -L${s.darwin.libresolv}/lib -lresolv -L${iconvCompat}/lib -liconvcompat -L${lib.getLib s.libiconvReal}/lib -liconv ''${LDFLAGS:-}"
             # ext/iconv.c, when it detects GNU libiconv (HAVE_LIBICONV, via the
             # _libiconv_version probe), `#undef`s any iconv->libiconv rename and
             # then calls the *plain* iconv() — which needs the included <iconv.h>
